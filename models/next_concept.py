@@ -289,7 +289,7 @@ class NextConceptTransformer(Transformer):
             torch.cat([bottom_left, bottom_right], dim=1),
         ], dim=0).reshape(1, 1, P + T, P + T)
 
-        self.register_buffer('attn_mask_for_masking', full_mask.contiguous())
+        self.register_buffer('attn_mask_for_masking', full_mask.contiguous(), persistent=False)
 
         self.use_flex_attention = bool(getattr(config, 'use_flex_attention', False))
         lvl_full = torch.cat([
