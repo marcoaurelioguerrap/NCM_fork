@@ -1,0 +1,71 @@
+task: tbs
+checkpoints:
+  generator: generator.pt
+  tokenizer: tokenizer.pt
+data:
+  train: train.jsonl
+  validation: validation.jsonl
+  test: test.jsonl
+model:
+  n_layer: 8
+  n_head: 8
+  bias: true
+  dropout: 0.1
+  n_embd: 512
+  context_length: 912
+  prefix_len: 832
+  raw_token_prefix: false
+  prefix_pad_token_id: 50257
+  ctx_encoder:
+    enabled: true
+    n_layer: 0
+    vocab_size: 50304
+  vocab_size: [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
+  predict_level0: false
+  query_level0: true
+  attn_pattern: block_diagonal
+  use_positional_encoding: true
+  use_level_encoding: true
+  use_rope: true
+  rope_base: 10000
+  use_qk_norm: true
+  tie_heads_to_codebook: true
+  tie_heads_learn_scale: true
+tokenizer:
+  pre_tokenizer:
+    name: char
+    tokenizer: char
+  vqvae:
+    n_layers: 6
+    embed_dim: 384
+    in_vocab_size: 72
+    context_length: 28
+    compression_factor: 1
+    dropout: 0.0
+    pre_quant_groupnorm: 8
+    pre_quant_dropout: 0.0
+    use_qk_norm: true
+    dec_layers: 2
+    vqvae_vocab_size: [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
+    checkpoint_path: tokenizer.pt
+    vector_quantizer_config:
+      clss: multiscale_residual_vector_quantizer
+      decay: 0.99
+      epsilon: 1.0e-05
+      commitment_cost: 0.1
+      restart_threshold: 0.0
+      learned_l1_cascade: false
+      learned_l1_cascade_base: 4
+      quant_resi:
+        enabled: true
+        ratio: 0.5
+        share_mode: 0
+        learnable_ratio: false
+      levels:
+        use_manual_levels: true
+        manual_levels: [1, 2, 3, 4, 6, 8, 12, 16, 28]
+generation:
+  temperature: 0.0
+  top_k: 0
+  top_p: 1.0
+  cfg_scale: 0.0
