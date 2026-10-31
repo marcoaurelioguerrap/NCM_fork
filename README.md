@@ -1,3 +1,5 @@
+> **Fork notice: TBS experiment.** This fork adds [`tbs_ncm/`](tbs_ncm/README.md), an NCM player for the turn-based strategy game at [marcoaurelioguerrap/turn_based_strategy_vibe](https://github.com/marcoaurelioguerrap/turn_based_strategy_vibe). Download the game from the [game releases](https://github.com/marcoaurelioguerrap/turn_based_strategy_vibe/releases) and the base checkpoint from this fork's [releases](https://github.com/marcoaurelioguerrap/NCM_fork/releases). Upstream NCM is [HazyResearch/ncm](https://github.com/HazyResearch/ncm); this is not an official Stanford or HazyResearch release.
+
 <h1 align="center"><img src="assets/ncm_logo.png" height="28" alt="NCM logo" /> Next-Concept Modeling</h1>
 
 <p align="center"><strong>Fast, Parallel Coarse-to-Fine Text Generation</strong></p>

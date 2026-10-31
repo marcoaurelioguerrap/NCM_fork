@@ -21,7 +21,8 @@ import tbs_ncm.common  # noqa: F401  (adds the game repo to sys.path)
 
 from tbs.agents.codec import encode_order
 from tbs.agents.protocol import AgentPlan
-from tbs_ncm.legal import legal_lines, nearest_legal_order
+from tbs_ncm.legal import legal_lines, nearest_legal_order, rank_legal_orders
+from tbs_ncm.personas import get_persona, push_persona
 from tbs_ncm.ncm_agent import (
     candidate_for_line,
     order_is_legal,
@@ -60,6 +61,45 @@ def make_view() -> dict:
     }
 
 
+def make_tactical_view(capture_hq: bool = False, can_attack: bool = False) -> dict:
+    sites = []
+    if capture_hq:
+        sites.append({"pos": [0, 0], "terrain": "H", "owner": "B"})
+    return {
+        "current_player": "A",
+        "build_options": [],
+        "unit_actions": {
+            "A1": {
+                "move_to": [[[1, 1], 1]],
+                "attack": [["B1", "rifle", 1, 40]] if can_attack else [],
+                "capture_remaining_hp": 10 if capture_hq else None,
+                "hold": True,
+            }
+        },
+        "units": [
+            {"id": "A1", "owner": "A", "type": "infantry", "pos": [0, 0], "hp": 100},
+            {"id": "B1", "owner": "B", "type": "infantry", "pos": [1, 0], "hp": 100},
+        ],
+        "sites": sites,
+    }
+
+
+class PushPersonaTests(unittest.TestCase):
+    def test_push_variant_removes_passive_behaviour(self):
+        for name in ("aggressive", "defensive", "infantry", "armor", "artillery"):
+            base = get_persona(name)
+            push = push_persona(name)
+            self.assertEqual(push.defense_radius, 0)
+            self.assertEqual(push.retreat_hp, 0.0)
+            self.assertEqual(push.home_bias, 0.0)
+            self.assertEqual(push.hold_prob, 0.0)
+            self.assertEqual(push.standoff, 0)
+            self.assertEqual(push.capture_prob, 1.0)
+            self.assertTrue(push.capture_first)
+            self.assertGreaterEqual(push.enemy_hq_bias, 1.4)
+            self.assertEqual(push.build_weights, base.build_weights)
+
+
 class LegalSetTests(unittest.TestCase):
     def test_legal_lines_skip_unavailable_and_unaffordable(self):
         lines = set(legal_lines(make_view()))
@@ -80,6 +120,15 @@ class LegalSetTests(unittest.TestCase):
         nearest = nearest_legal_order(view, "m A1 9,9")
         self.assertIsNotNone(nearest)
         self.assertTrue(order_is_legal(view, nearest.order))
+
+    def test_rank_legal_orders_stays_inside_action_and_unit(self):
+        view = make_view()
+        ranked = rank_legal_orders(view, "m A1 9,9", limit=8)
+        self.assertTrue(ranked)
+        self.assertEqual({item.order["action"] for item in ranked}, {"move"})
+        self.assertEqual({item.order["unit"] for item in ranked}, {"A1"})
+        for item in ranked:
+            self.assertTrue(order_is_legal(view, item.order))
 
     def test_repair_same_unit_action_and_unit_snap(self):
         view = make_view()
@@ -127,9 +176,16 @@ class StubFallback:
         return AgentPlan(orders=[{"action": "hold", "unit": "A1"}])
 
 
+class ScoringSampler(StubSampler):
+    def score_lines(self, text, lines):
+        return [10.0 if line == "m A1 2,1" else 0.0 for line in lines]
+
+
 class AgentRerankTests(unittest.TestCase):
-    def request(self, feedback=None):
-        return SimpleNamespace(view=make_view(), feedback=feedback or [], player="A")
+    def request(self, feedback=None, view=None):
+        return SimpleNamespace(
+            view=view or make_view(), feedback=feedback or [], player="A"
+        )
 
     def test_rerank_keeps_sampling_until_exact(self):
         from tbs_ncm.ncm_agent import NcmAgent
@@ -178,6 +234,65 @@ class AgentRerankTests(unittest.TestCase):
         self.assertEqual(agent.rejected, 1)
         self.assertEqual(agent.recovered, 1)
         self.assertEqual(agent.fallbacks, 0)
+
+    def test_legal_decode_returns_model_preferred_legal_order(self):
+        from tbs_ncm.ncm_agent import NcmAgent
+
+        agent = NcmAgent(
+            ScoringSampler(["m A1 9,9"]),
+            decode="legal",
+            fallback=StubFallback(),
+        )
+        with patch("tbs_ncm.ncm_agent.encode_state", return_value="state"):
+            plan = agent.plan(self.request())
+        self.assertEqual(plan.orders, [{"action": "move", "unit": "A1", "to": [2, 1]}])
+        self.assertEqual(agent.constrained, 1)
+        self.assertEqual(agent.generated, 0)
+        self.assertEqual(agent.fallbacks, 0)
+        self.assertEqual(agent.constrained_lines, ["m A1 2,1"])
+
+    def test_legal_decode_raw_sample_still_counts_as_generated(self):
+        from tbs_ncm.ncm_agent import NcmAgent
+
+        agent = NcmAgent(
+            ScoringSampler(["m A1 1,1"]),
+            decode="legal",
+            fallback=StubFallback(),
+        )
+        with patch("tbs_ncm.ncm_agent.encode_state", return_value="state"):
+            plan = agent.plan(self.request())
+        self.assertEqual(plan.orders, [{"action": "move", "unit": "A1", "to": [1, 1]}])
+        self.assertEqual(agent.generated, 1)
+        self.assertEqual(agent.constrained, 0)
+
+    def test_tactical_priority_captures_enemy_hq(self):
+        from tbs_ncm.ncm_agent import NcmAgent
+
+        agent = NcmAgent(
+            ScoringSampler(["h A1"]),
+            decode="legal",
+            fallback=StubFallback(),
+        )
+        with patch("tbs_ncm.ncm_agent.encode_state", return_value="state"):
+            plan = agent.plan(self.request(view=make_tactical_view(capture_hq=True)))
+        self.assertEqual(plan.orders, [{"action": "capture", "unit": "A1"}])
+        self.assertEqual(agent.constrained, 1)
+        self.assertEqual(agent.tactical, 1)
+        self.assertEqual(agent.generated, 0)
+
+    def test_tactical_priority_attacks_when_no_capture(self):
+        from tbs_ncm.ncm_agent import NcmAgent
+
+        agent = NcmAgent(
+            ScoringSampler(["h A1"]),
+            decode="legal",
+            fallback=StubFallback(),
+        )
+        with patch("tbs_ncm.ncm_agent.encode_state", return_value="state"):
+            plan = agent.plan(self.request(view=make_tactical_view(can_attack=True)))
+        self.assertEqual(plan.orders[0]["action"], "attack")
+        self.assertEqual(plan.orders[0]["unit"], "A1")
+        self.assertEqual(agent.tactical, 1)
 
 
 if __name__ == "__main__":

@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from .common import ARTIFACT_DIR, load_config, load_generator_state
 from .chartok import CharTokenizer
-from .legal import NearestLegal, legal_lines, nearest_legal_order
+from .legal import NearestLegal, legal_lines, nearest_legal_order, rank_legal_orders
 
 from models.next_concept import NextConceptTransformer
 from models.vqvae import VQVAE
@@ -22,6 +23,8 @@ from tbs.agents.codec import CodecError, decode_order, encode_order, encode_stat
 from tbs.agents.greedy import GreedyAgent
 from tbs.agents.protocol import AgentPlan
 from tbs.engine.hexgrid import hex_distance
+
+from .action_model import ActionModel
 
 # Candidate ranking: lower is better.  A nearest-legal global snap outranks a
 # unit-snapped *different* action because the latter is more likely to be an
@@ -623,9 +626,41 @@ class NcmSampler:
         char_ids = self.vqvae.decode(codes).argmax(dim=-1)
         return self.chartok.decode(char_ids[0].tolist()).strip()
 
+    @torch.no_grad()
+    def score_lines(self, state_text: str, lines: list[str]) -> list[float]:
+        """Mean log-probability of each candidate order under this model.
+
+        This is the same teacher-forced objective used for validation: encode
+        each line with the VQ-VAE, run the generator with the state prefix, and
+        average the per-code log-probability.  Higher is better.
+        """
+        if not lines:
+            return []
+        context = int(self.cfg.tokenizer.vqvae.context_length)
+        targets = [self.chartok.encode_padded(line, context) for line in lines]
+        target = torch.tensor(targets, dtype=torch.long, device=self.device)
+        codes = self.vqvae.encode(target)
+        x_target = self.vqvae.vq.idx_to_ncm_input(codes)
+        prefix = torch.tensor(
+            [self.prefix_ids(state_text)] * len(lines), device=self.device
+        )
+        l0 = self.net.l0_queries.expand(len(lines), -1, -1)
+        x = torch.cat([l0, x_target], dim=1)
+        pad_mask = prefix == self.pad_id
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=self.device == "cuda"
+        ):
+            logits = self.net(x, prefix_ids=prefix, prefix_pad_mask=pad_mask)
+        losses = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            codes.reshape(-1),
+            reduction="none",
+        ).view(len(lines), -1)
+        return [float(-row.mean().item()) for row in losses]
+
 
 class NcmAgent:
-    """One generated order per step; a scripted policy recovers if all samples fail."""
+    """One order per step: free sample + repair, or legal-candidate rerank."""
 
     name = "ncm"
 
@@ -636,17 +671,34 @@ class NcmAgent:
         retries: int = 6,
         retry_temperature: float = 0.5,
         fallback: object | None = None,
+        decode: str = "sample",
+        rerank_limit: int = 8,
+        action_model: ActionModel | str | Path | None = None,
     ):
+        if decode not in ("sample", "legal"):
+            raise ValueError(f"decode must be 'sample' or 'legal', got {decode!r}")
         self.sampler = sampler
+        self.action_model: ActionModel | None
+        if isinstance(action_model, ActionModel):
+            self.action_model = action_model
+        else:
+            path = Path(action_model) if action_model else ARTIFACT_DIR / "action_clf.pt"
+            self.action_model = (
+                ActionModel(path, device=getattr(sampler, "device", None)) if path.exists() else None
+            )
         self.temperature = temperature
         self.retries = max(0, int(retries))
         self.retry_temperature = retry_temperature
         self.fallback = fallback if fallback is not None else GreedyAgent()
+        self.decode = decode
+        self.rerank_limit = max(1, int(rerank_limit))
         self.steps = 0
         self.samples = 0
         self.generated = 0
         self.repaired = 0
         self.repaired_samples = 0
+        self.constrained = 0
+        self.tactical = 0
         self.fallbacks = 0
         self.illegal = 0
         self.rejected = 0
@@ -654,6 +706,7 @@ class NcmAgent:
         self.state_too_long = 0
         self.generation_errors = 0
         self.lines: list[str] = []
+        self.constrained_lines: list[str] = []
         self.fallback_reasons: list[str] = []
         self.repairs: Counter[str] = Counter()
         self.actions: Counter[str] = Counter()
@@ -665,6 +718,7 @@ class NcmAgent:
         self.geometry_samples = 0
         self.enemy_distance = 0.0
         self.home_distance = 0.0
+        self.action_model_orders = 0
         self._last_line = ""
         self._last_order: dict | None = None
 
@@ -695,6 +749,28 @@ class NcmAgent:
             allowed = legal_lines(view)
         except Exception:
             allowed = []
+
+        # The generator collapses rare action characters to "m".  A small
+        # learned action selector picks the action character; the full NCM still
+        # supplies the arguments through legal candidate lines.  This is a
+        # two-stage model, not the scripted ferry advisor.
+        if self.action_model is not None and view.get("ferry"):
+            order = self._action_model_order(state_text, view, allowed, request.player)
+            if order is not None:
+                try:
+                    line = encode_order(order)
+                except (CodecError, KeyError):
+                    line = ""
+                if line and not (feedback and self._last_line == line):
+                    self.action_model_orders += 1
+                    self._remember(line, order)
+                    self._note_order(view, order)
+                    return AgentPlan(orders=[order], commentary="action-model")
+
+        if self.decode == "legal":
+            return self._constrained_plan(
+                request, state_text, view, allowed, avoid, feedback
+            )
 
         best: Repair | None = None
         best_key: tuple[int, float, int] | None = None
@@ -750,6 +826,378 @@ class NcmAgent:
             return AgentPlan(orders=[best.order], commentary="")
 
         return self._fallback(request, "rejected" if feedback else "no-legal-sample")
+
+    def _constrained_plan(
+        self,
+        request,
+        state_text: str,
+        view: dict,
+        allowed: list[str],
+        avoid: str,
+        feedback: bool,
+    ) -> AgentPlan:
+        """Pick a legal order with the model as the ranker.
+
+        One free sample provides the model's intended action/unit.  The legal
+        lines for that unit/action are then scored by the same teacher-forced
+        objective used in training, and the highest-scoring legal line is
+        returned.  This is a constrained decode: the order is always legal,
+        and the NCM chooses among the legal alternatives instead of producing
+        an illegal string that needs a string-distance repair.
+        """
+        if not allowed:
+            return self._fallback(request, "no-legal-orders")
+
+        try:
+            line = self.sampler.sample(state_text, temperature=self.temperature)
+        except ValueError as exc:
+            message = str(exc)
+            if "GPT-2 tokens" in message or "prefix needs" in message:
+                self.state_too_long += 1
+                return self._fallback(request, "state-too-long")
+            self.generation_errors += 1
+            return self._fallback(request, "generation-error")
+        except RuntimeError:
+            self.generation_errors += 1
+            return self._fallback(request, "generation-error")
+
+        self.samples += 1
+        self.lines.append(line)
+        candidate = candidate_for_line(view, line, allowed=allowed)
+        raw_line = (
+            candidate.line
+            if candidate is not None and candidate.kind == "generated"
+            else ""
+        )
+        raw_action = (
+            str(candidate.order.get("action"))
+            if candidate is not None and candidate.kind == "generated"
+            else (line.split()[0] if line.split() else "")
+        )
+
+        raw_ranked = rank_legal_orders(
+            view, line, allowed=allowed, limit=self.rerank_limit
+        )
+        tactical, tactical_scores = self._tactical_candidates(
+            view, allowed, limit=self.rerank_limit
+        )
+        merged: dict[str, NearestLegal] = {item.line: item for item in raw_ranked}
+        for item in tactical:
+            merged.setdefault(item.line, item)
+        if tactical:
+            ordered: list[NearestLegal] = list(tactical)
+            ordered.extend(
+                item for item in raw_ranked if item.line not in tactical_scores
+            )
+            merged = {item.line: item for item in ordered[: self.rerank_limit * 2]}
+        candidates = list(merged.values())
+        if not candidates:
+            nearest = nearest_legal_order(view, line, allowed=allowed)
+            candidates = [nearest] if nearest is not None else []
+
+        best: NearestLegal | None = None
+        if candidates:
+            try:
+                scores = self.sampler.score_lines(
+                    state_text, [item.line for item in candidates]
+                )
+            except (RuntimeError, ValueError):
+                scores = []
+            if len(scores) == len(candidates):
+                combined = [
+                    (
+                        scores[index]
+                        + tactical_scores.get(item.line, 0.0)
+                        + (2.0 if raw_line and item.line == raw_line else 0.0),
+                        item,
+                    )
+                    for index, item in enumerate(candidates)
+                ]
+                combined.sort(key=lambda pair: pair[0], reverse=True)
+                for _score, item in combined:
+                    if avoid and encode_order(item.order) == avoid:
+                        continue
+                    best = item
+                    break
+            if best is None:
+                for item in candidates:
+                    if avoid and encode_order(item.order) == avoid:
+                        continue
+                    best = item
+                    break
+
+        if best is not None:
+            encoded = encode_order(best.order)
+            chosen_raw = bool(raw_line and best.line == raw_line)
+            if chosen_raw:
+                self.generated += 1
+            else:
+                self.constrained += 1
+                self.constrained_lines.append(best.line)
+                if (
+                    tactical_scores.get(best.line, 0.0) > 0
+                    and str(best.order.get("action")) != raw_action
+                ):
+                    self.tactical += 1
+            if feedback:
+                self.recovered += 1
+            self._remember(encoded, best.order)
+            self._note_order(view, best.order)
+            return AgentPlan(
+                orders=[best.order],
+                commentary="constrained-raw" if chosen_raw else "legal-tactical",
+            )
+
+        return self._fallback(request, "no-legal-order")
+
+    def _tactical_candidates(
+        self, view: dict, allowed: list[str], limit: int
+    ) -> tuple[list[NearestLegal], dict[str, float]]:
+        """Legal orders ranked by winning progress, not just model style."""
+        player = view.get("current_player")
+        units = {
+            str(unit["id"]): unit
+            for unit in view.get("units", [])
+            if unit.get("pos") is not None
+        }
+        sites = {tuple(site["pos"]): site for site in view.get("sites", [])}
+        enemy_hq = next(
+            (
+                unit
+                for unit in units.values()
+                if unit.get("type") == "hq" and unit.get("owner") != player
+            ),
+            None,
+        )
+        own_hq = next(
+            (
+                unit
+                for unit in units.values()
+                if unit.get("type") == "hq" and unit.get("owner") == player
+            ),
+            None,
+        )
+        ctx = {
+            "player": player,
+            "units": units,
+            "sites": sites,
+            "unit_actions": view.get("unit_actions") or {},
+            "enemy_positions": [
+                tuple(unit["pos"])
+                for unit in units.values()
+                if unit.get("owner") != player
+            ],
+            "capturable": {
+                tuple(site["pos"])
+                for site in view.get("sites", [])
+                if site.get("owner") != player
+                and site.get("capture_needed") is not None
+            },
+            "enemy_hq_pos": tuple(enemy_hq["pos"]) if enemy_hq is not None else None,
+            "home": tuple(own_hq["pos"]) if own_hq is not None else None,
+            "persona": getattr(getattr(self, "fallback", None), "persona", None),
+        }
+        scored: list[tuple[float, NearestLegal]] = []
+        for candidate_line in allowed:
+            try:
+                order = decode_order(candidate_line)
+            except CodecError:
+                continue
+            score = self._tactical_score(order, ctx)
+            if score > 0:
+                scored.append((score, NearestLegal(candidate_line, order, score)))
+        scored.sort(key=lambda pair: (-pair[0], pair[1].line))
+        top = scored[: max(1, limit)]
+        return [item for _score, item in top], {
+            item.line: float(score) for score, item in top
+        }
+
+    def _tactical_score(self, order: dict, ctx: dict) -> float:
+        action = str(order.get("action"))
+        units = ctx["units"]
+        unit = units.get(str(order.get("unit")))
+        persona = ctx["persona"]
+        home = ctx["home"]
+        enemy_hq_pos = ctx["enemy_hq_pos"]
+        enemy_positions = ctx["enemy_positions"]
+
+        if action == "capture":
+            if unit is None:
+                return 0.0
+            site = ctx["sites"].get(tuple(unit["pos"]))
+            if site is None:
+                return 0.0
+            if site.get("terrain") == "H" and site.get("owner") != ctx["player"]:
+                return 500.0
+            score = 30.0
+            if persona is not None:
+                score += 10.0 * float(getattr(persona, "capture_prob", 1.0))
+            return score
+
+        if action == "attack":
+            target = units.get(str(order.get("target")))
+            if target is None or unit is None:
+                return 0.0
+            preview = 0.0
+            attacks = (ctx["unit_actions"].get(str(unit["id"]), {}) or {}).get(
+                "attack", []
+            )
+            for row in attacks:
+                if len(row) < 4 or str(row[0]) != str(target["id"]):
+                    continue
+                if order.get("weapon") and str(row[1]) != str(order.get("weapon")):
+                    continue
+                preview = float(row[3])
+                break
+            score = max(1.0, preview)
+            if target.get("type") == "hq":
+                score += 25.0
+            if preview >= float(target.get("hp", 100)):
+                score += 30.0
+            if persona is not None:
+                bonus = float(
+                    getattr(persona, "target_bonus", {}).get(
+                        str(target.get("type")), 0.0
+                    )
+                )
+                score += bonus * max(1.0, preview)
+                if target.get("type") == "hq":
+                    score += 10.0 * float(getattr(persona, "hq_bonus", 0.0))
+                radius = int(getattr(persona, "defense_radius", 0) or 0)
+                if (
+                    radius
+                    and home is not None
+                    and hex_distance(tuple(target["pos"]), home) > radius
+                ):
+                    score -= 20.0
+            return score
+
+        if action == "move":
+            if unit is None or not order.get("to"):
+                return 0.0
+            pos = tuple(unit["pos"])
+            dest = tuple(order["to"])
+            if enemy_hq_pos is not None:
+                gain = max(
+                    0,
+                    hex_distance(pos, enemy_hq_pos)
+                    - hex_distance(dest, enemy_hq_pos),
+                )
+            elif enemy_positions:
+                gain = max(
+                    0,
+                    min(hex_distance(pos, spot) for spot in enemy_positions)
+                    - min(hex_distance(dest, spot) for spot in enemy_positions),
+                )
+            else:
+                gain = 0
+            score = gain * 8.0
+            if dest in ctx["capturable"]:
+                score += 15.0
+            if enemy_hq_pos is not None and dest == enemy_hq_pos:
+                score += 20.0
+            if persona is not None:
+                score *= max(0.2, float(getattr(persona, "enemy_hq_bias", 1.0)) + 0.2)
+                if home is not None:
+                    home_bias = float(getattr(persona, "home_bias", 0.0))
+                    if home_bias:
+                        score -= home_bias * min(hex_distance(dest, home), 12)
+                    radius = int(getattr(persona, "defense_radius", 0) or 0)
+                    if radius and hex_distance(dest, home) > radius:
+                        score -= 20.0
+                standoff = int(getattr(persona, "standoff", 0) or 0)
+                if standoff and enemy_positions:
+                    d_enemy = min(hex_distance(dest, spot) for spot in enemy_positions)
+                    score += max(0.0, 4.0 - abs(d_enemy - standoff)) * 4.0
+            return score
+
+        if action == "build":
+            unit_type = str(order.get("unit") or "")
+            score = 1.0
+            if persona is not None:
+                score += 1.0 * float(
+                    getattr(persona, "build_weights", {}).get(unit_type, 0.0)
+                )
+            return score
+
+        if action in ("load", "unload"):
+            return 1.0
+        return 0.0
+
+    def _action_model_order(
+        self,
+        state_text: str,
+        view: dict,
+        allowed: list[str],
+        player: str,
+    ) -> dict | None:
+        """Pick a legal action-model order, or None to let the generator decide."""
+        assert self.action_model is not None
+        action = self.action_model.predict(state_text)
+        if action not in ("l", "u", "c"):
+            return None
+        candidates = [line for line in allowed if line.startswith(action + " ")]
+        if not candidates:
+            return None
+
+        units = {str(unit.get("id")): unit for unit in view.get("units", ()) if isinstance(unit, dict)}
+        if action == "l":
+            def load_key(line: str) -> tuple:
+                parts = line.split()
+                if len(parts) < 3:
+                    return (9, 9, 9, line)
+                transport = units.get(parts[1], {})
+                cargo = units.get(parts[2], {})
+                return (
+                    0 if transport.get("type") == "transport_ship" else 1,
+                    0 if cargo.get("type") == "infantry" else 1,
+                    0 if cargo.get("stranded") else 1,
+                    line,
+                )
+
+            valid = [
+                line
+                for line in candidates
+                if len(line.split()) >= 3
+                and units.get(line.split()[2], {}).get("type") != "hq"
+                and units.get(line.split()[2], {}).get("move", 0) > 0
+            ]
+            if not valid:
+                return None
+            line = min(valid, key=load_key)
+        elif action == "u":
+            sites = [
+                site
+                for site in view.get("sites", ())
+                if isinstance(site, dict)
+                and site.get("capture_needed") is not None
+                and site.get("owner") != player
+            ]
+            objectives = [site for site in sites if site.get("objective")] or sites
+
+            def unload_key(line: str) -> tuple:
+                parts = line.split()
+                if len(parts) < 4:
+                    return (10**6, line)
+                try:
+                    target = tuple(int(value) for value in parts[3].split(","))
+                except (ValueError, IndexError):
+                    return (10**6, line)
+                distance = (
+                    min(hex_distance(target, tuple(site["pos"])) for site in objectives)
+                    if objectives
+                    else 0
+                )
+                return (distance, line)
+
+            line = min(candidates, key=unload_key)
+        else:
+            line = sorted(candidates)[0]
+
+        try:
+            return decode_order(line)
+        except CodecError:
+            return None
 
     def _remember(self, line: str, order: dict) -> None:
         self._last_line = line or encode_order(order)

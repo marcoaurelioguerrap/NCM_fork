@@ -387,6 +387,7 @@ PAGE = r"""<!doctype html>
   .grow { flex: 1; }
   main { padding: 16px 18px 60px; max-width: 1500px; margin: 0 auto; }
   .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .toolbar label { color: var(--dim); font-size: 11px; display: flex; align-items: center; gap: 6px; }
   .filters { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .filters label { color: var(--dim); font-size: 11px; display: flex; align-items: center; gap: 6px; }
   .matchup-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -401,7 +402,7 @@ PAGE = r"""<!doctype html>
               letter-spacing: .8px; }
   .match-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
   .match-note { color: var(--dim); margin-top: 9px; }
-  #kpis, #game-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px,1fr));
+  #kpis, #game-kpis, #overview-kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px,1fr));
           gap: 10px; margin-bottom: 16px; }
   .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
          padding: 9px 11px; }
@@ -410,6 +411,9 @@ PAGE = r"""<!doctype html>
   .kpi .v { font-size: 17px; margin-top: 3px; font-variant-numeric: tabular-nums; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px,1fr));
           gap: 14px; }
+  #overview-charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #overview-batches { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  @media (max-width: 980px) { #overview-charts, #overview-batches { grid-template-columns: 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
           padding: 12px 14px; }
   .chart { width: 100%; height: 168px; display: block; }
@@ -456,6 +460,7 @@ PAGE = r"""<!doctype html>
           border: 1px solid var(--line); vertical-align: middle; }
   .qbar i { display: block; height: 100%; }
   .qbar .gen { background: var(--ok); }
+  .qbar .con { background: var(--accent); }
   .qbar .rep { background: var(--warn); }
   .qbar .fb { background: var(--bad); }
   .modal { position: fixed; inset: 0; background: rgba(3,7,12,.82); z-index: 40;
@@ -524,6 +529,7 @@ PAGE = r"""<!doctype html>
   <nav class="tabs">
     <button id="tab-training" class="tab active" onclick="setTab('training')">Training</button>
     <button id="tab-games" class="tab" onclick="setTab('games')">Games</button>
+    <button id="tab-overview" class="tab" onclick="setTab('overview')">Overview</button>
   </nav>
   <span id="where" class="dim"></span>
   <span class="grow"></span>
@@ -568,6 +574,23 @@ PAGE = r"""<!doctype html>
       </div>
     </div>
     <div id="games-table"></div>
+  </section>
+  <section id="overview-view" hidden>
+    <div id="overview-kpis"></div>
+    <div class="toolbar">
+      <span class="dim">A batch is one evaluation or league run. Charts use the recorded learner/NCM side.</span>
+      <span class="grow"></span>
+      <label>batch scope
+        <select id="overview-batch-limit">
+          <option value="8">latest 8</option>
+          <option value="12" selected>latest 12</option>
+          <option value="0">all</option>
+        </select>
+      </label>
+    </div>
+    <div id="overview-charts" class="grid"></div>
+    <div id="overview-batches" class="grid" style="margin-top:14px"></div>
+    <div id="overview-foot" class="dim" style="margin-top:10px"></div>
   </section>
   <footer id="foot"></footer>
 </main>
@@ -630,8 +653,11 @@ const STAGE_PANELS = {
       {key: 'orders', label: 'orders', kinds: ['step']}]},
     {title: 'NCM order quality', series: [
       {key: 'generated', label: 'generated', kinds: ['step']},
+      {key: 'constrained', label: 'constrained', kinds: ['step']},
       {key: 'repaired', label: 'repaired', kinds: ['step']},
-      {key: 'fallbacks', label: 'fallback', kinds: ['step']}]}
+      {key: 'fallbacks', label: 'fallback', kinds: ['step']}]},
+    {title: 'Model legal share', series: [
+      {key: 'legal_share', label: 'model legal', kinds: ['step']}]}
   ],
   vs_ncm: [
     {title: 'Result per game (learner vs opponent)', series: [
@@ -691,7 +717,8 @@ const STAGE_KPIS = {
     ['losses', 'losses', 'int'], ['unfinished', 'unfinished', 'int'],
     ['win_rate', 'win rate vs opp', 'pct'], ['finished_rate', 'finished', 'pct'],
     ['avg_score_delta', 'avg score', 'num'], ['avg_turns', 'avg turns', 'num'],
-    ['generated', 'generated', 'int'], ['repaired', 'repaired', 'int'],
+    ['generated', 'generated', 'int'], ['constrained', 'constrained', 'int'],
+    ['repaired', 'repaired', 'int'], ['legal_share', 'model legal', 'pct'],
     ['fallbacks', 'fallbacks', 'int']
   ],
   vs_ncm: [
@@ -719,7 +746,7 @@ const TERRAIN = {
 const SIDE_COLOR = {A: 'var(--a)', B: 'var(--b)'};
 const state = {
   tab: 'training', runs: [], id: null, payload: null,
-  games: [], reports: [], detail: null, frame: 0, playing: false,
+  games: [], reports: [], batches: [], batchLimit: 12, detail: null, frame: 0, playing: false,
   timer: null, speed: 350, runSignature: '', gamesSignature: null,
   filters: {source: 'all', result: 'all', seed: '', text: ''}
 };
@@ -811,11 +838,14 @@ function drawChart(host, visible, opts = {}) {
   }
   const xs = visible.flatMap((s) => s.points.map((p) => p[0]));
   let xmin = Math.min(...xs), xmax = Math.max(...xs);
-  let ymin = Math.min(...all), ymax = Math.max(...all);
+  let ymin = opts.yMin !== undefined ? +opts.yMin : Math.min(...all);
+  let ymax = opts.yMax !== undefined ? +opts.yMax : Math.max(...all);
   if (xmax === xmin) xmax = xmin + 1;
   if (ymax === ymin) { const d = Math.abs(ymin || 1) * 0.1; ymin -= d; ymax += d; }
-  const ypad = (ymax - ymin) * 0.08;
+  const ypad = opts.padY === false ? 0 : (ymax - ymin) * 0.08;
   ymin -= ypad; ymax += ypad;
+  const yFormat = opts.yFormat || 'num';
+  const legendFormat = opts.legendFormat || 'num';
   const X = (x) => padL + (x - xmin) / (xmax - xmin) * (W - padL - padR);
   const Y = (y) => padT + (1 - (y - ymin) / (ymax - ymin)) * (H - padT - padB);
 
@@ -824,7 +854,7 @@ function drawChart(host, visible, opts = {}) {
     const value = ymin + (ymax - ymin) * (i / 3);
     const y = Y(value);
     svg += `<line x1="${padL}" x2="${W - padR}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>`;
-    svg += `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${esc(fmt(value, 'num'))}</text>`;
+    svg += `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${esc(fmt(value, yFormat))}</text>`;
   }
   for (const frac of [0, 0.5, 1]) {
     const value = xmin + (xmax - xmin) * frac;
@@ -843,7 +873,7 @@ function drawChart(host, visible, opts = {}) {
   const legend = visible.map((s, i) => {
     const last = s.points[s.points.length - 1][1];
     const color = s.color ? `var(${s.color})` : `var(${COLORS[i % COLORS.length]})`;
-    return `<span><i class="swatch" style="background:${color}"></i>${esc(s.label)} ${esc(fmt(last, 'num'))}</span>`;
+    return `<span><i class="swatch" style="background:${color}"></i>${esc(s.label)} ${esc(fmt(last, legendFormat))}</span>`;
   }).join('');
   host.innerHTML = svg + `<div class="legend">${legend}</div>`;
 }
@@ -853,6 +883,526 @@ function lineChart(host, series) {
   const visible = series.map((s) => ({...s, points: seriesPoints(s.key, s.kinds)}))
     .filter((s) => s.points.length);
   drawChart(host, visible);
+}
+
+function median(values) {
+  const sorted = values.map(Number).filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function rowStamp(row) {
+  const stamp = +row.mtime;
+  if (Number.isFinite(stamp) && stamp > 0) return stamp;
+  const text = String(row.finished_at || '').trim();
+  const parsed = Date.parse(text.replace(' ', 'T'));
+  return Number.isFinite(parsed) ? parsed / 1000 : 0;
+}
+
+function dayKey(row) {
+  const text = String(row.finished_at || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
+  const stamp = rowStamp(row);
+  if (!stamp) return 'unknown';
+  const date = new Date(stamp * 1000);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function shortDay(label) {
+  const text = String(label || '');
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text.slice(5) : text;
+}
+
+function chronologicalGames(rows) {
+  return rows.slice().sort((a, b) =>
+    (rowStamp(a) - rowStamp(b)) || String(a.id || '').localeCompare(String(b.id || '')));
+}
+
+function resultBucket(row) {
+  if (!row.finished) return 'unfinished';
+  if (row.learner_won === true || row.learner_won === 1) return 'win';
+  if (row.learner_won === false || row.learner_won === 0) return 'loss';
+  return 'unknown';
+}
+
+function resultSeries(rows) {
+  const series = [
+    {key: 'win', label: 'learner win', color: 'var(--ok)'},
+    {key: 'loss', label: 'learner loss', color: 'var(--bad)'},
+    {key: 'unfinished', label: 'unfinished', color: 'var(--dim)'}
+  ];
+  if (rows.some((row) => resultBucket(row) === 'unknown')) {
+    series.push({key: 'unknown', label: 'unknown', color: 'var(--warn)'});
+  }
+  return series;
+}
+
+function groupTotal(group) {
+  return Object.values(group.values || {}).reduce((sum, value) => sum + (+value || 0), 0);
+}
+
+function outcomeGroups(rows, keyFor) {
+  const groups = new Map();
+  for (const row of rows) {
+    const label = String(keyFor(row) || 'unknown');
+    if (!groups.has(label)) {
+      groups.set(label, {win: 0, loss: 0, unfinished: 0, unknown: 0});
+    }
+    groups.get(label)[resultBucket(row)] += 1;
+  }
+  return [...groups.entries()]
+    .map(([label, values]) => ({label, values}))
+    .sort((a, b) => groupTotal(b) - groupTotal(a) || a.label.localeCompare(b.label));
+}
+
+function histogramGroups(values, opts = {}) {
+  const numbers = values.map(Number).filter((value) => Number.isFinite(value));
+  const maxBins = Math.max(1, Number(opts.bins) || 12);
+  if (!numbers.length) return {groups: [], min: 0, max: 0, width: 0, n: 0};
+  let min = Math.min(...numbers);
+  let max = Math.max(...numbers);
+  let width;
+  if (opts.integer) {
+    width = Math.max(1, Math.ceil((max - min + 1) / maxBins));
+    min = Math.floor(min / width) * width;
+  } else {
+    if (max === min) { min -= 0.5; max += 0.5; }
+    width = (max - min) / maxBins;
+  }
+  const span = max - min + (opts.integer ? 1 : 0);
+  const binCount = Math.max(1, Math.ceil(span / width));
+  const counts = Array(binCount).fill(0);
+  for (const value of numbers) {
+    let index = Math.floor((value - min) / width);
+    if (index < 0) index = 0;
+    if (index >= binCount) index = binCount - 1;
+    counts[index] += 1;
+  }
+  const groups = counts.map((count, index) => {
+    const low = min + index * width;
+    const high = low + width;
+    return {
+      label: opts.integer
+        ? `${fmt(low, 'int')}–${fmt(high - 1, 'int')}`
+        : `${fmt(low, 'num')} … ${fmt(high, 'num')}`,
+      mid: low + width / 2,
+      values: {count}
+    };
+  });
+  return {groups, min, max: min + binCount * width, width, n: numbers.length};
+}
+
+function drawStackedBars(host, groups, series, opts = {}) {
+  if (!host) return;
+  const visibleSeries = series.filter((entry) =>
+    groups.some((group) => (+group.values[entry.key] || 0) > 0));
+  if (!groups.length || !visibleSeries.length) {
+    host.innerHTML = '<div class="empty">no data yet</div>';
+    return;
+  }
+  const W = Math.max(320, host.clientWidth || 460), H = 168;
+  const padL = 48, padR = 14, padT = 10, padB = 26;
+  const totals = groups.map(groupTotal);
+  let ymax = opts.yMax !== undefined ? +opts.yMax : Math.max(...totals, 1);
+  if (opts.yMax === undefined) ymax = ymax <= 4 ? 4 : Math.ceil(ymax / 4) * 4;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const X = (fraction) => padL + fraction * plotW;
+  const Y = (value) => padT + (1 - value / ymax) * plotH;
+  const slot = plotW / groups.length;
+  const barW = Math.max(8, Math.min(52, slot * 0.62));
+  const yFormat = opts.yFormat || 'int';
+  let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+  for (let i = 0; i <= 4; i++) {
+    const value = ymax * (i / 4);
+    const y = Y(value);
+    svg += `<line x1="${padL}" x2="${W - padR}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>`;
+    svg += `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${esc(fmt(value, yFormat))}</text>`;
+  }
+  if (opts.markerX !== undefined && opts.markerX !== null && Number.isFinite(+opts.markerX)) {
+    const marker = X(+opts.markerX);
+    svg += `<line x1="${marker.toFixed(1)}" x2="${marker.toFixed(1)}" y1="${padT}" y2="${H - padB}" stroke="var(--warn)" stroke-width="1" stroke-dasharray="3 3"/>`;
+    if (opts.markerLabel) {
+      svg += `<text x="${(marker + 4).toFixed(1)}" y="${(padT + 9).toFixed(1)}" fill="var(--warn)">${esc(opts.markerLabel)}</text>`;
+    }
+  }
+  const labelEvery = Math.max(1, Math.ceil(groups.length / 8));
+  groups.forEach((group, index) => {
+    const center = X((index + 0.5) / groups.length);
+    const left = center - barW / 2;
+    const title = `${opts.titleLabel ? opts.titleLabel(group) : group.label} · ` + visibleSeries
+      .map((entry) => {
+        const value = +group.values[entry.key] || 0;
+        return `${entry.label} ${opts.titleFormat ? opts.titleFormat(value) : value}`;
+      }).join(' · ');
+    let bottom = plotH;
+    for (const entry of visibleSeries) {
+      const value = +group.values[entry.key] || 0;
+      if (!value) continue;
+      const height = (value / ymax) * plotH;
+      bottom -= height;
+      svg += `<rect x="${left.toFixed(1)}" y="${(padT + bottom).toFixed(1)}" width="${barW.toFixed(1)}" height="${height.toFixed(1)}" fill="${entry.color}"><title>${esc(title)}</title></rect>`;
+    }
+    if (index % labelEvery === 0) {
+      const raw = String(opts.xLabel ? opts.xLabel(group) : group.label);
+      const label = raw.length > 20 ? raw.slice(0, 19) + '…' : raw;
+      svg += `<text x="${center.toFixed(1)}" y="${H - 6}" text-anchor="middle">${esc(label)}</text>`;
+    }
+  });
+  svg += '</svg>';
+  const legend = visibleSeries.map((entry) => {
+    const total = groups.reduce((sum, group) => sum + (+group.values[entry.key] || 0), 0);
+    const suffix = opts.legendTotal === false ? '' : ' ' + esc(fmt(total, opts.legendFormat || 'int'));
+    return `<span><i class="swatch" style="background:${entry.color}"></i>${esc(entry.label)}${suffix}</span>`;
+  }).join('');
+  host.innerHTML = svg + `<div class="legend">${legend}</div>`;
+}
+
+function drawValueBars(host, groups, opts = {}) {
+  if (!host) return;
+  const usable = groups.filter((group) => Number.isFinite(+group.value));
+  if (!usable.length) {
+    host.innerHTML = `<div class="empty">${esc(opts.empty || 'no data yet')}</div>`;
+    return;
+  }
+  const W = Math.max(320, host.clientWidth || 460), H = 168;
+  const padL = 54, padR = 14, padT = 16, padB = 30;
+  const values = usable.map((group) => +group.value);
+  let ymin = opts.yMin !== undefined ? +opts.yMin : Math.min(0, ...values);
+  let ymax = opts.yMax !== undefined ? +opts.yMax : Math.max(0, ...values);
+  if (ymax === ymin) { ymax += 1; ymin -= 1; }
+  if (opts.yMin === undefined) ymin -= Math.abs(ymax - ymin) * 0.10;
+  if (opts.yMax === undefined) ymax += Math.abs(ymax - ymin) * 0.10;
+  if (opts.zeroLine) {
+    const hasNegative = values.some((value) => value < 0);
+    const hasPositive = values.some((value) => value > 0);
+    if (opts.yMin === undefined && !hasNegative) ymin = 0;
+    if (opts.yMax === undefined && !hasPositive) ymax = 0;
+    ymin = Math.min(0, ymin);
+    ymax = Math.max(0, ymax);
+  }
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const X = (fraction) => padL + fraction * plotW;
+  const Y = (value) => padT + (1 - (value - ymin) / (ymax - ymin)) * plotH;
+  const slot = plotW / usable.length;
+  const barW = Math.max(8, Math.min(52, slot * 0.62));
+  const yFormat = opts.yFormat || 'int';
+  const zeroY = opts.zeroLine ? Y(0) : Y(Math.max(ymin, 0));
+  let svg = `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
+  for (let i = 0; i <= 4; i++) {
+    const value = ymin + (ymax - ymin) * (i / 4);
+    const y = Y(value);
+    svg += `<line x1="${padL}" x2="${W - padR}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="var(--line)" stroke-width="1"/>`;
+    svg += `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" text-anchor="end">${esc(fmt(value, yFormat))}</text>`;
+  }
+  if (opts.zeroLine) {
+    svg += `<line x1="${padL}" x2="${W - padR}" y1="${zeroY.toFixed(1)}" y2="${zeroY.toFixed(1)}" stroke="var(--dim)" stroke-width="1"/>`;
+  }
+  const labelEvery = Math.max(1, Math.ceil(usable.length / 8));
+  usable.forEach((group, index) => {
+    const value = +group.value;
+    const center = X((index + 0.5) / usable.length);
+    const left = center - barW / 2;
+    const yValue = Y(value);
+    const top = Math.min(zeroY, yValue);
+    const height = Math.max(1, Math.abs(zeroY - yValue));
+    const color = typeof opts.color === 'function' ? opts.color(group) : (opts.color || 'var(--accent)');
+    const full = opts.titleLabel ? opts.titleLabel(group) : group.label;
+    const n = group.n !== undefined ? ` · n=${group.n}` : '';
+    svg += `<rect x="${left.toFixed(1)}" y="${top.toFixed(1)}" width="${barW.toFixed(1)}" height="${height.toFixed(1)}" fill="${color}"><title>${esc(full + n)}</title></rect>`;
+    if (opts.showValues !== false && usable.length <= 16) {
+      const text = opts.formatValue ? opts.formatValue(value) : fmt(value, yFormat);
+      const labelY = value >= 0 ? top - 3 : top + height + 9;
+      svg += `<text x="${center.toFixed(1)}" y="${labelY.toFixed(1)}" text-anchor="middle">${esc(text)}</text>`;
+    }
+    if (index % labelEvery === 0) {
+      const raw = String(opts.xLabel ? opts.xLabel(group) : group.label);
+      const label = raw.length > 20 ? raw.slice(0, 19) + '…' : raw;
+      svg += `<text x="${center.toFixed(1)}" y="${H - 6}" text-anchor="middle">${esc(label)}</text>`;
+    }
+  });
+  svg += '</svg>';
+  const legend = opts.legend ? `<div class="legend">${esc(opts.legend)}</div>` : '';
+  host.innerHTML = svg + legend;
+}
+
+function drawHistogram(host, values, opts = {}) {
+  const histogram = histogramGroups(values, {bins: opts.bins || 12, integer: !!opts.integer});
+  const markerX = opts.zeroLine && histogram.min < 0 && histogram.max > 0
+    ? (0 - histogram.min) / (histogram.max - histogram.min)
+    : undefined;
+  drawStackedBars(host, histogram.groups, [
+    {key: 'count', label: opts.label || 'games', color: opts.color || 'var(--accent)'}
+  ], {
+    xLabel: (group) => fmt(group.mid, opts.integer ? 'int' : 'num'),
+    markerX,
+    markerLabel: markerX !== undefined ? '0' : '',
+    yFormat: 'int'
+  });
+  return histogram;
+}
+
+function qualityEntries(rows) {
+  return chronologicalGames(rows).map((row) => {
+    const stats = qualityStats(row);
+    return stats.total ? {row, stats} : null;
+  }).filter(Boolean);
+}
+
+function rollingQuality(entries, key, windowSize) {
+  return entries.map((_, index) => {
+    const start = Math.max(0, index - windowSize + 1);
+    let part = 0, total = 0;
+    for (let i = start; i <= index; i++) {
+      const stats = entries[i].stats;
+      if (key === 'legal') part += stats.gen + stats.con + stats.rep;
+      else if (key === 'repaired') part += stats.rep;
+      else if (key === 'fallback') part += stats.fb;
+      total += stats.total;
+    }
+    return [index, total ? part / total * 100 : null];
+  }).filter((point) => Number.isFinite(+point[1]));
+}
+
+function drawQualityTrend(host, entries) {
+  if (!host) return;
+  if (!entries.length) {
+    host.innerHTML = '<div class="empty">no order-provenance data yet</div>';
+    return;
+  }
+  const windowSize = Math.min(10, entries.length);
+  const visible = [
+    {label: 'model legal', color: '--c3', points: rollingQuality(entries, 'legal', windowSize)},
+    {label: 'repaired', color: '--c2', points: rollingQuality(entries, 'repaired', windowSize)},
+    {label: 'fallback', color: '--c5', points: rollingQuality(entries, 'fallback', windowSize)}
+  ].filter((series) => series.points.length);
+  drawChart(host, visible, {
+    xLabel: (value) => {
+      const index = Math.max(0, Math.min(entries.length - 1, Math.round(value)));
+      return '#' + (index + 1);
+    },
+    yFormat: 'pct100',
+    yMin: 0,
+    yMax: 100,
+    padY: false,
+    legendFormat: 'pct100'
+  });
+}
+
+function renderOverviewKpis(rows) {
+  const finished = rows.filter((row) => row.finished).length;
+  const wins = rows.filter((row) =>
+    row.finished && (row.learner_won === true || row.learner_won === 1)).length;
+  const scores = rows.map((row) => +row.score_delta).filter((value) => Number.isFinite(value));
+  const turns = rows.map((row) => +row.turns).filter((value) => Number.isFinite(value));
+  const withQuality = rows.map(qualityStats).filter((stats) => stats.total);
+  const orders = withQuality.reduce((sum, stats) => sum + stats.total, 0);
+  const legal = withQuality.reduce((sum, stats) => sum + stats.gen + stats.con + stats.rep, 0);
+  const cards = [
+    ['games', rows.length, 'int'],
+    ['finished', finished, 'int'],
+    ['learner wins', wins, 'int'],
+    ['win rate (finished)', finished ? wins / finished : null, 'pct'],
+    ['avg score Δ', scores.length ? scores.reduce((sum, value) => sum + value, 0) / scores.length : null, 'num'],
+    ['median turns', median(turns), 'int'],
+    ['replayable', rows.filter((row) => row.has_replay).length, 'int'],
+    ['model legal', orders ? legal / orders : null, 'pct']
+  ];
+  $('overview-kpis').innerHTML = cards.map(([label, value, how]) =>
+    `<div class="kpi"><div class="k">${esc(label)}</div><div class="v">${fmt(value, how)}</div></div>`
+  ).join('');
+}
+
+function renderOverview() {
+  const rows = state.games || [];
+  if (!rows.length) {
+    $('overview-kpis').innerHTML = '';
+    $('overview-charts').innerHTML = '<div class="card wide"><div class="empty">no saved games yet — the overview fills in as matches land in artifacts/tbs/matches</div></div>';
+    $('overview-batches').innerHTML = '';
+    $('overview-foot').textContent = '';
+    return;
+  }
+  renderOverviewKpis(rows);
+  const outcomes = resultSeries(rows);
+  const timeline = outcomeGroups(rows, (row) => dayKey(row));
+  timeline.sort((a, b) => String(a.label).localeCompare(String(b.label)));
+  const scenarios = outcomeGroups(rows, (row) => row.scenario || 'unknown');
+  const scores = rows.map((row) => +row.score_delta).filter((value) => Number.isFinite(value));
+  const turns = rows.map((row) => +row.turns).filter((value) => Number.isFinite(value));
+  const quality = qualityEntries(rows);
+  const scoreMedian = median(scores);
+  const turnMedian = median(turns);
+  const qualityWindow = Math.min(10, quality.length);
+  const scoreLabel = `n=${scores.length}${scoreMedian === null ? '' : ' · median ' + (+scoreMedian).toFixed(1)}`;
+  const turnLabel = `n=${turns.length}${turnMedian === null ? '' : ' · median ' + fmt(turnMedian, 'int')}`;
+  $('overview-charts').innerHTML = `
+    <div class="card wide"><h2>Results by day <span class="dim">learner outcome · unfinished kept separate</span></h2><div id="ov-timeline"></div></div>
+    <div class="card"><h2>Outcome by scenario <span class="dim">all ${rows.length} games</span></h2><div id="ov-scenarios"></div></div>
+    <div class="card"><h2>Final score Δ <span class="dim">${esc(scoreLabel)}</span></h2><div id="ov-scores"></div></div>
+    <div class="card"><h2>Game length <span class="dim">${esc(turnLabel)}</span></h2><div id="ov-turns"></div></div>
+    <div class="card"><h2>Order quality <span class="dim">${qualityWindow}-game rolling · by saved game order</span></h2><div id="ov-quality"></div></div>
+  `;
+  drawStackedBars($('ov-timeline'), timeline, outcomes, {
+    xLabel: (group) => shortDay(group.label)
+  });
+  drawStackedBars($('ov-scenarios'), scenarios, outcomes, {
+    xLabel: (group) => String(group.label).replace(/_/g, ' ')
+  });
+  drawHistogram($('ov-scores'), scores, {bins: 12, zeroLine: true, color: 'var(--accent)'});
+  drawHistogram($('ov-turns'), turns, {bins: 8, integer: true, color: 'var(--c4)'});
+  drawQualityTrend($('ov-quality'), quality);
+  const batches = visibleBatches();
+  renderBatchOverview(rows, batches);
+  const finished = rows.filter((row) => row.finished).length;
+  const allBatchCount = (state.batches || []).filter((batch) => (+batch.assigned || 0) > 0).length;
+  const batchNote = allBatchCount
+    ? ` · batch charts: ${batches.length}/${allBatchCount} evaluation batches` +
+      (batches.length < allBatchCount ? ' (change batch scope above)' : '')
+    : ' · no evaluation batches found yet';
+  $('overview-foot').textContent =
+    `${rows.length} saved games · ${finished} finished · outcome uses the learner side ` +
+    `(NCM in play games, evaluated model in arena/self-play). Score and length include ` +
+    `unfinished games at their final saved position.${batchNote} Batch = one evaluation/league run; ` +
+    `standalone play games are excluded from batch charts.`;
+}
+
+function renderBatchOverview(rows, batches) {
+  const host = $('overview-batches');
+  if (!host) return;
+  if (!batches.length) {
+    host.innerHTML = '<div class="card wide"><div class="empty">no evaluation or league batches found yet — batch charts appear when a run writes a report.json under artifacts/tbs/personas or vs_ncm</div></div>';
+    return;
+  }
+  const stats = batchStatsFor(rows, batches);
+  const byId = new Map(batches.map((batch) => [batch.id, batch]));
+  const xLabel = (group) => (byId.get(group.label) || {}).short || group.label;
+  const titleLabel = (group) => batchFullLabel(byId.get(group.label));
+  const batchRows = rows.filter((row) => byId.has(row.batch));
+  const outcomes = stats.map((entry) => ({
+    label: entry.batch.id,
+    values: {
+      win: entry.win,
+      loss: entry.loss,
+      unfinished: entry.unfinished,
+      unknown: entry.unknown
+    }
+  }));
+  const winRows = stats.filter((entry) => entry.finished > 0).map((entry) => ({
+    label: entry.batch.id,
+    value: entry.win / entry.finished * 100,
+    n: entry.finished
+  }));
+  const scoreRows = stats.filter((entry) => entry.scoreN > 0).map((entry) => ({
+    label: entry.batch.id,
+    value: entry.scoreSum / entry.scoreN,
+    n: entry.scoreN
+  }));
+  const provenanceSeries = [
+    {key: 'gen', label: 'generated', color: 'var(--ok)'},
+    {key: 'con', label: 'constrained', color: 'var(--accent)'},
+    {key: 'rep', label: 'repaired', color: 'var(--warn)'},
+    {key: 'fb', label: 'fallback', color: 'var(--bad)'}
+  ];
+  const provenance = stats.filter((entry) => entry.q.total > 0).map((entry) => {
+    const total = entry.q.total;
+    return {
+      label: entry.batch.id,
+      values: {
+        gen: entry.q.gen / total,
+        con: entry.q.con / total,
+        rep: entry.q.rep / total,
+        fb: entry.q.fb / total
+      }
+    };
+  });
+  const actionSeries = [
+    {key: 'move', label: 'move', color: 'var(--c1)'},
+    {key: 'attack', label: 'attack', color: 'var(--c5)'},
+    {key: 'capture', label: 'capture', color: 'var(--warn)'},
+    {key: 'build', label: 'build', color: 'var(--c2)'},
+    {key: 'hold', label: 'hold', color: 'var(--c4)'},
+    {key: 'other', label: 'load/unload', color: 'var(--dim)'}
+  ];
+  const actions = stats.filter((entry) => entry.actions.total > 0).map((entry) => {
+    const total = entry.actions.total;
+    return {
+      label: entry.batch.id,
+      values: {
+        move: entry.actions.move / total,
+        attack: entry.actions.attack / total,
+        capture: entry.actions.capture / total,
+        build: entry.actions.build / total,
+        hold: entry.actions.hold / total,
+        other: entry.actions.other / total
+      }
+    };
+  });
+  const turnRows = stats.filter((entry) => entry.turns.length).map((entry) => ({
+    label: entry.batch.id,
+    value: median(entry.turns),
+    n: entry.turns.length
+  }));
+  const winNote = `${winRows.length} batch${winRows.length === 1 ? '' : 'es'} with finished games`;
+  const scoreNote = `${scoreRows.length} batch${scoreRows.length === 1 ? '' : 'es'} with a final score`;
+  const provenanceNote = `${provenance.length} batch${provenance.length === 1 ? '' : 'es'} with order provenance`;
+  const actionNote = `${actions.length} batch${actions.length === 1 ? '' : 'es'} with action counts`;
+  host.innerHTML = `
+    <div class="card wide"><h2>Outcome by batch <span class="dim">${batches.length} runs · learner/NCM winner · unfinished kept separate</span></h2><div id="ov-batch-outcomes"></div></div>
+    <div class="card"><h2>Win rate by batch <span class="dim">finished games only · ${esc(winNote)}</span></h2><div id="ov-batch-winrate"></div></div>
+    <div class="card"><h2>Final score Δ by batch <span class="dim">mean final board score · ${esc(scoreNote)}</span></h2><div id="ov-batch-score"></div></div>
+    <div class="card"><h2>Order provenance by batch <span class="dim">learner side · share of orders · ${esc(provenanceNote)}</span></h2><div id="ov-batch-provenance"></div></div>
+    <div class="card"><h2>Action mix by batch <span class="dim">learner side · share of orders · ${esc(actionNote)}</span></h2><div id="ov-batch-actions"></div></div>
+    <div class="card"><h2>Game length by batch <span class="dim">median turns · ${turnRows.length} batches</span></h2><div id="ov-batch-turns"></div></div>
+  `;
+  drawStackedBars($('ov-batch-outcomes'), outcomes, resultSeries(batchRows), {
+    xLabel,
+    titleLabel
+  });
+  drawValueBars($('ov-batch-winrate'), winRows, {
+    xLabel,
+    titleLabel,
+    yMin: 0,
+    yMax: 100,
+    yFormat: 'pct100',
+    formatValue: (value) => value.toFixed(0) + '%',
+    color: 'var(--accent)'
+  });
+  drawValueBars($('ov-batch-score'), scoreRows, {
+    xLabel,
+    titleLabel,
+    zeroLine: true,
+    yFormat: 'int',
+    formatValue: (value) => (value >= 0 ? '+' : '') + value.toFixed(1),
+    color: (group) => +group.value >= 0 ? 'var(--ok)' : 'var(--bad)'
+  });
+  drawStackedBars($('ov-batch-provenance'), provenance, provenanceSeries, {
+    xLabel,
+    titleLabel,
+    yMax: 1,
+    yFormat: 'pct',
+    legendTotal: false,
+    titleFormat: (value) => (value * 100).toFixed(1) + '%'
+  });
+  drawStackedBars($('ov-batch-actions'), actions, actionSeries, {
+    xLabel,
+    titleLabel,
+    yMax: 1,
+    yFormat: 'pct',
+    legendTotal: false,
+    titleFormat: (value) => (value * 100).toFixed(1) + '%'
+  });
+  drawValueBars($('ov-batch-turns'), turnRows, {
+    xLabel,
+    titleLabel,
+    yMin: 0,
+    yFormat: 'int',
+    formatValue: (value) => value.toFixed(0),
+    color: 'var(--c4)'
+  });
 }
 
 const MATCH_SETTING_LABELS = {
@@ -1157,23 +1707,124 @@ function qualityStats(row) {
   const q = row.quality || {};
   const learner = q.learner || row.learner || {};
   const gen = Number(learner.generated) || 0;
+  const con = Number(learner.constrained) || 0;
+  const tactical = Number(learner.tactical) || 0;
   const rep = Number(learner.repaired) || 0;
   const fb = Number(learner.fallbacks) || 0;
   const ill = Number(learner.illegal) || 0;
-  const total = gen + rep + fb;
-  return {gen, rep, fb, ill, total, pct: total ? gen / total : null};
+  const total = gen + con + rep + fb;
+  return {gen, con, tactical, rep, fb, ill, total, pct: total ? (gen + con) / total : null};
+}
+
+function actionStats(row) {
+  const q = row.quality || {};
+  const learner = q.learner || row.learner || {};
+  const actions = learner.actions || {};
+  const counts = {move: 0, attack: 0, capture: 0, build: 0, hold: 0, other: 0};
+  for (const key of ['move', 'attack', 'capture', 'build', 'hold']) {
+    counts[key] = Number(actions[key]) || 0;
+  }
+  counts.other = (Number(actions.load) || 0) + (Number(actions.unload) || 0);
+  counts.total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  return counts;
+}
+
+function visibleBatches() {
+  let batches = (state.batches || []).filter((batch) => (+batch.assigned || 0) > 0);
+  if (!batches.length) {
+    const seen = new Map();
+    for (const row of state.games || []) {
+      if (!row.batch || seen.has(row.batch)) continue;
+      seen.set(row.batch, {
+        id: row.batch,
+        label: row.batch_label || row.batch,
+        short: row.batch_short || row.batch_label || row.batch,
+        kind: row.batch_kind || '',
+        at: row.batch_at || 0,
+        generator: row.batch_generator,
+        decode: row.batch_decode,
+        maps: row.batch_maps || [],
+        max_turns: row.batch_max_turns,
+        assigned: 1
+      });
+    }
+    batches = [...seen.values()];
+  }
+  batches.sort((a, b) => (+a.at || 0) - (+b.at || 0) || String(a.id).localeCompare(String(b.id)));
+  const limit = Number(state.batchLimit) || 0;
+  return limit > 0 ? batches.slice(-limit) : batches;
+}
+
+function batchFullLabel(batch) {
+  if (!batch) return 'batch';
+  const bits = [batch.label || batch.id];
+  if (batch.generator) bits.push(batch.generator);
+  if (batch.decode) bits.push('decode ' + batch.decode);
+  const maps = batch.maps || [];
+  if (maps.length) bits.push(maps.length === 1 ? maps[0] : `${maps.length} maps`);
+  if (batch.max_turns) bits.push('turn cap ' + batch.max_turns);
+  return bits.join(' · ');
+}
+
+function batchStatsFor(rows, batches) {
+  const stats = new Map();
+  for (const batch of batches) {
+    stats.set(batch.id, {
+      batch,
+      games: 0,
+      win: 0,
+      loss: 0,
+      unfinished: 0,
+      unknown: 0,
+      finished: 0,
+      scoreSum: 0,
+      scoreN: 0,
+      turns: [],
+      q: {gen: 0, con: 0, rep: 0, fb: 0, total: 0},
+      actions: {move: 0, attack: 0, capture: 0, build: 0, hold: 0, other: 0, total: 0}
+    });
+  }
+  for (const row of rows) {
+    const entry = stats.get(row.batch);
+    if (!entry) continue;
+    entry.games += 1;
+    entry[resultBucket(row)] += 1;
+    const score = +row.score_delta;
+    if (Number.isFinite(score)) {
+      entry.scoreSum += score;
+      entry.scoreN += 1;
+    }
+    const turns = +row.turns;
+    if (Number.isFinite(turns)) entry.turns.push(turns);
+    const q = qualityStats(row);
+    entry.q.gen += q.gen;
+    entry.q.con += q.con;
+    entry.q.rep += q.rep;
+    entry.q.fb += q.fb;
+    entry.q.total += q.total;
+    const actions = actionStats(row);
+    for (const key of ['move', 'attack', 'capture', 'build', 'hold', 'other']) {
+      entry.actions[key] += actions[key];
+    }
+    entry.actions.total += actions.total;
+  }
+  for (const entry of stats.values()) {
+    entry.finished = entry.win + entry.loss + entry.unknown;
+  }
+  return [...stats.values()];
 }
 
 function qualityCell(row) {
   const q = qualityStats(row);
-  if (!q.total) return '<span class="dim">—</span>';
+  if (!q.total) return '<span class="dim">-</span>';
   const pct = (q.pct * 100).toFixed(0);
   const g = (q.gen / q.total * 100).toFixed(0);
+  const c = (q.con / q.total * 100).toFixed(0);
   const r = (q.rep / q.total * 100).toFixed(0);
   const f = (q.fb / q.total * 100).toFixed(0);
-  return `<span class="quality"><b>${pct}%</b> <span class="dim">gen</span>
-    <span class="qbar"><i class="gen" style="width:${g}%"></i><i class="rep" style="width:${r}%"></i><i class="fb" style="width:${f}%"></i></span>
-    <span class="dim">${q.gen}/${q.rep}/${q.fb}</span></span>`;
+  return `<span class="quality"><b>${pct}%</b> <span class="dim">model legal</span>
+    <span class="qbar"><i class="gen" style="width:${g}%"></i><i class="con" style="width:${c}%"></i><i class="rep" style="width:${r}%"></i><i class="fb" style="width:${f}%"></i></span>
+    <span class="dim">${q.gen}/${q.con}/${q.rep}/${q.fb}</span></span>`;
 }
 
 function sideName(row, side) {
@@ -1246,7 +1897,7 @@ function filteredGames() {
     if (f.result === 'unfinished' && row.finished) return false;
     if (f.seed && !String(row.seed ?? '').includes(f.seed)) return false;
     if (f.text) {
-      const hay = `${row.id || ''} ${row.file || ''} ${row.label || ''} ${row.scenario || ''} ${whenText(row)}`.toLowerCase();
+      const hay = `${row.id || ''} ${row.file || ''} ${row.label || ''} ${row.batch_label || ''} ${row.scenario || ''} ${whenText(row)}`.toLowerCase();
       if (!hay.includes(f.text.toLowerCase())) return false;
     }
     return true;
@@ -1259,9 +1910,11 @@ function renderGameKpis(rows) {
   const wins = rows.filter((row) => row.learner_won).length;
   const withQuality = rows.map(qualityStats).filter((q) => q.total);
   const gen = withQuality.reduce((sum, q) => sum + q.gen, 0);
+  const con = withQuality.reduce((sum, q) => sum + q.con, 0);
+  const tactical = withQuality.reduce((sum, q) => sum + q.tactical, 0);
   const rep = withQuality.reduce((sum, q) => sum + q.rep, 0);
   const fb = withQuality.reduce((sum, q) => sum + q.fb, 0);
-  const orders = gen + rep + fb;
+  const orders = gen + con + rep + fb;
   const scores = rows.filter((row) => Number.isFinite(+row.score_delta));
   const avgScore = scores.length ? scores.reduce((sum, row) => sum + (+row.score_delta), 0) / scores.length : null;
   const replayable = rows.filter((row) => row.has_replay).length;
@@ -1276,6 +1929,9 @@ function renderGameKpis(rows) {
     ['avg score Δ', avgScore, 'num'],
     ['replayable', replayable, 'int'],
     ['generated', orders ? gen / orders : null, 'pct'],
+    ['constrained', orders ? con / orders : null, 'pct'],
+    ['tactical', orders ? tactical / orders : null, 'pct'],
+    ['model legal', orders ? (gen + con + rep) / orders : null, 'pct'],
     ['fallback', orders ? fb / orders : null, 'pct']
   ];
   $('game-kpis').innerHTML = cards.map(([label, value, how]) =>
@@ -1297,7 +1953,7 @@ function renderGamesTable() {
     const quality = qualityCell(row);
     const score = Number.isFinite(+row.score_delta) ? fmt(row.score_delta, 'num') : '—';
     const label = row.label || row.id || '';
-    const detail = [file || '', row.arena_phase || ''].filter(Boolean).join(' · ');
+    const detail = [file || '', row.arena_phase || '', row.batch_short ? 'batch · ' + row.batch_short : ''].filter(Boolean).join(' · ');
     return `<tr class="game-row${disabled}" ${file ? `data-file="${attr(file)}"` : ''} title="${attr(matchupText(row))}">
       <td><div>${esc(label)}</div><div class="dim">${esc(detail)}</div></td>
       <td class="when">${whenCell(row)}</td>
@@ -1313,7 +1969,7 @@ function renderGamesTable() {
   }).join('');
   $('games-table').innerHTML = `<div class="card wide"><h2>Games (${rows.length})</h2>
     <table><thead><tr><th>game</th><th>played</th><th>seed</th><th>matchup</th><th>result</th><th>turns</th>
-    <th>score Δ</th><th>NCM quality (gen/rep/fb)</th><th>source</th><th>replay</th></tr></thead>
+    <th>score Δ</th><th>NCM quality (gen/con/rep/fb)</th><th>source</th><th>replay</th></tr></thead>
     <tbody>${body}</tbody></table></div>`;
 }
 
@@ -1322,14 +1978,16 @@ async function pollGames() {
     const data = await getJSON('/api/games');
     state.games = data.games || [];
     state.reports = data.reports || [];
+    state.batches = data.batches || [];
     const signature = state.games.map((row) => {
       const q = qualityStats(row);
-      return `${row.id}:${row.source}:${row.status}:${row.finished}:${row.turns}:${row.score_delta}:${whenText(row)}:${q.gen}/${q.rep}/${q.fb}`;
+      return `${row.id}:${row.source}:${row.status}:${row.finished}:${row.turns}:${row.score_delta}:${row.batch}:${whenText(row)}:${q.gen}/${q.con}/${q.tactical}/${q.rep}/${q.fb}`;
     }).join('|');
     if (signature !== state.gamesSignature) {
       state.gamesSignature = signature;
       renderGamesTable();
     }
+    if (state.tab === 'overview') renderOverview();
     $('clock').textContent = new Date().toLocaleTimeString() + ' · refreshing 2s';
   } catch (error) {
     $('clock').innerHTML = `<span class="msg">disconnected: ${esc(error.message)}</span>`;
@@ -1340,10 +1998,16 @@ function setTab(tab) {
   state.tab = tab;
   $('tab-training').classList.toggle('active', tab === 'training');
   $('tab-games').classList.toggle('active', tab === 'games');
+  $('tab-overview').classList.toggle('active', tab === 'overview');
   $('training-view').hidden = tab !== 'training';
   $('games-view').hidden = tab !== 'games';
+  $('overview-view').hidden = tab !== 'overview';
   if (tab === 'training') pollTraining();
-  else pollGames();
+  else if (tab === 'games') pollGames();
+  else {
+    renderOverview();
+    pollGames();
+  }
 }
 
 function closeDetail() {
@@ -1397,6 +2061,7 @@ function renderDetail() {
       <div class="chip"><div class="k">turns</div><div class="v">${esc(match.turns ?? '')}</div></div>
       <div class="chip"><div class="k">orders</div><div class="v">${esc(payload.n_orders)}</div></div>
       ${match.arena_phase ? `<div class="chip"><div class="k">arena phase</div><div class="v">${esc(match.arena_phase)}</div></div>` : ''}
+      ${match.batch_label ? `<div class="chip"><div class="k">batch</div><div class="v">${esc(match.batch_label)}</div></div>` : ''}
       <div class="chip"><div class="k">score Δ</div><div class="v">${Number.isFinite(+match.score_delta) ? esc(fmt(match.score_delta, 'num')) : '—'}</div></div>
       <div class="chip"><div class="k">replay</div><div class="v">${replay}</div></div>
     </div>
@@ -1644,10 +2309,12 @@ function renderQuality() {
   const learner = quality.learner || {};
   const opponent = quality.opponent || {};
   const gen = Number(learner.generated) || 0;
+  const con = Number(learner.constrained) || 0;
+  const tactical = Number(learner.tactical) || 0;
   const rep = Number(learner.repaired) || 0;
   const fb = Number(learner.fallbacks) || 0;
   const ill = Number(learner.illegal) || 0;
-  const total = gen + rep + fb;
+  const total = gen + con + rep + fb;
   const fmtCount = (value) => Number.isFinite(+value) ? String(value) : '—';
   let reasons = quality.fallback_reasons || {};
   if (reasons && typeof reasons === 'object' && reasons[side] && typeof reasons[side] === 'object') {
@@ -1664,15 +2331,17 @@ function renderQuality() {
   const cell = (value, cls) => Number.isFinite(+value)
     ? `<td class="${cls}">${esc(value)}</td>` : '<td class="dim">—</td>';
   host.innerHTML = `<h2>${esc(heading)}</h2>
-    <table class="quality-table"><thead><tr><th>generated</th><th>repaired</th><th>fallback</th>
-    <th>illegal samples</th><th>generated share</th></tr></thead><tbody><tr>
+    <table class="quality-table"><thead><tr><th>generated</th><th>constrained</th><th>tactical</th><th>repaired</th><th>fallback</th>
+    <th>illegal samples</th><th>model legal</th></tr></thead><tbody><tr>
       ${cell(learner.generated, 'ok')}
+      ${cell(learner.constrained, 'ok')}
+      ${cell(learner.tactical, 'ok')}
       ${cell(learner.repaired, 'warn')}
       ${cell(learner.fallbacks, 'bad-text')}
       ${cell(learner.illegal, '')}
-      <td>${total ? (gen / total * 100).toFixed(1) + '%' : '—'}</td>
+      <td>${total ? ((gen + con + rep) / total * 100).toFixed(1) + '%' : '—'}</td>
     </tr></tbody></table>
-    ${opponent && Object.keys(opponent).length ? `<div class="dim" style="margin-top:8px">${esc(opponentLabel)}: gen ${fmtCount(opponent.generated)} · rep ${fmtCount(opponent.repaired)} · fb ${fmtCount(opponent.fallbacks)}</div>` : ''}
+    ${opponent && Object.keys(opponent).length ? `<div class="dim" style="margin-top:8px">${esc(opponentLabel)}: gen ${fmtCount(opponent.generated)} · con ${fmtCount(opponent.constrained)} · tac ${fmtCount(opponent.tactical)} · rep ${fmtCount(opponent.repaired)} · fb ${fmtCount(opponent.fallbacks)}</div>` : ''}
     ${reasonRows ? `<h2 style="margin-top:14px">Fallback reasons</h2><table class="quality-table"><tbody>${reasonRows}</tbody></table>` : ''}`;
 }
 
@@ -1739,6 +2408,11 @@ $('filter-text').addEventListener('input', (event) => {
   renderGamesTable();
 });
 
+$('overview-batch-limit').addEventListener('change', (event) => {
+  state.batchLimit = Number(event.target.value) || 0;
+  if (state.tab === 'overview') renderOverview();
+});
+
 $('games-table').addEventListener('click', (event) => {
   const row = event.target.closest('tr[data-file]');
   if (!row) return;
@@ -1754,13 +2428,15 @@ document.addEventListener('keydown', (event) => {
 });
 
 window.addEventListener('resize', () => {
-  if (!state.payload) return;
-  const stage = state.payload.summary.stage;
-  (STAGE_PANELS[stage] || []).forEach((panel, i) => {
-    const host = document.getElementById('chart-' + i);
-    if (host) lineChart(host, panel.series);
-  });
+  if (state.payload) {
+    const stage = state.payload.summary.stage;
+    (STAGE_PANELS[stage] || []).forEach((panel, i) => {
+      const host = document.getElementById('chart-' + i);
+      if (host) lineChart(host, panel.series);
+    });
+  }
   if (state.detail && !state.detail.error) renderDetailCharts();
+  if (state.tab === 'overview') renderOverview();
 });
 
 const startup = new URLSearchParams(location.search);
@@ -1769,6 +2445,7 @@ updateResultFilterLabels();
 pollTraining();
 pollGames();
 if (startup.get('tab') === 'games') setTab('games');
+else if (startup.get('tab') === 'overview') setTab('overview');
 if (startup.get('game')) setTimeout(() => openGame(startup.get('game')), 350);
 setInterval(() => {
   if (state.tab === 'training') pollTraining();

@@ -15,9 +15,11 @@ from __future__ import annotations
 import json
 import time
 from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .batches import attach_batches
 from .common import ARTIFACT_DIR, GAME_REPO
 
 from tbs.engine import rules
@@ -63,6 +65,27 @@ def _time_text(stamp: float) -> str:
     if not stamp:
         return ""
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
+
+
+def _display_time(value: object) -> str:
+    """Normalize metadata timestamps for the narrow Games table.
+
+    League writers may store ISO-8601 (with microseconds and a timezone);
+    the dashboard reads a compact local ``YYYY-MM-DD HH:MM``.  Parsing here
+    keeps older saved games correct without rewriting their sidecars.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "T" in text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone()
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            pass
+    return text
 
 
 def scenario_index() -> dict[str, Path]:
@@ -210,6 +233,58 @@ def _decorate_display(row: dict) -> dict:
     opponent = _pretty_opponent(row.get("opponent"))
     labels = {"A": "A", "B": "B"}
 
+    world = row.get("world_cup") if isinstance(row.get("world_cup"), dict) else {}
+    team_labels = row.get("team_labels") if isinstance(row.get("team_labels"), dict) else {}
+    if world and team_labels:
+        labels = {
+            side: str(team_labels.get(side) or side) for side in ("A", "B")
+        }
+        row["side_labels"] = labels
+        row["opponent_label"] = labels["B"]
+        winner_side = world.get("winner_side") or row.get("winner")
+        winner_name = world.get("winner_name")
+        if winner_side in labels:
+            row["winner_label"] = labels[winner_side]
+        elif winner_name:
+            row["winner_label"] = str(winner_name)
+        else:
+            row["winner_label"] = None
+        # The World Cup has its own turn cap, so a saved game can still say
+        # "ongoing" when the league has already declared a draw or a board-score
+        # winner.  The tournament metadata is authoritative for its games.
+        if world.get("decided_by") in ("draw", "board", "seed", "victory"):
+            row["finished"] = True
+        if row.get("finished"):
+            row["result_label"] = (
+                "draw" if not (winner_side or winner_name) else "decided"
+            )
+        else:
+            row["result_label"] = "unfinished"
+        return row
+
+    if source == "all_ai_league" and team_labels:
+        # Neutral league games have no NCM "learner" side.  Use the labels the
+        # league wrote instead of the bare A/B fallback and derive the result
+        # from the league decision rather than learner_won.
+        labels = {
+            side: str(team_labels.get(side) or side) for side in ("A", "B")
+        }
+        league = row.get("league") if isinstance(row.get("league"), dict) else {}
+        row["side_labels"] = labels
+        row["opponent_label"] = labels["B"]
+        winner_side = row.get("winner") or league.get("winner")
+        decided_by = league.get("decided_by")
+        if winner_side in labels:
+            row["winner_label"] = labels[winner_side]
+            row["result_label"] = (
+                f"{labels[winner_side]} win"
+                + (" (board)" if decided_by == "board" else "")
+            )
+        else:
+            row["winner_label"] = None
+            row["result_label"] = "draw" if row.get("finished") else "unfinished"
+        return row
+
     if source == "play":
         if ncm_side in ("A", "B"):
             other = "B" if ncm_side == "A" else "A"
@@ -232,7 +307,12 @@ def _decorate_display(row: dict) -> dict:
             opponent_persona = row.get("opponent_persona")
             if learner_persona and opponent_persona:
                 labels[learner] = f"{learner_persona} · NCM"
-                labels[other] = f"{opponent_persona} · NCM"
+                suffix = (
+                    "Heuristic"
+                    if row.get("opponent_kind") == "heuristic"
+                    else "NCM"
+                )
+                labels[other] = f"{opponent_persona} · {suffix}"
                 row["learner_label"] = labels[learner]
             else:
                 labels[learner] = "Learner NCM"
@@ -256,8 +336,11 @@ def _decorate_display(row: dict) -> dict:
         row["winner_label"] = None
 
     finished = bool(row.get("finished"))
+    status = str(row.get("status") or "").lower()
     learner_won = row.get("learner_won")
-    if finished and learner_won in (True, 1):
+    if finished and status == "draw":
+        row["result_label"] = "draw"
+    elif finished and learner_won in (True, 1):
         row["result_label"] = "NCM win" if source == "play" else "Learner win"
     elif finished and learner_won in (False, 0) and row.get("learner_side") in ("A", "B"):
         row["result_label"] = "NCM loss" if source == "play" else "Learner loss"
@@ -391,6 +474,7 @@ def _selfplay_rows() -> list[dict]:
                     "mtime": stamp,
                     "duration_s": game.get("seconds"),
                     "meta_path": None,
+                    "batch_path": str(path),
                 }
             )
     return rows
@@ -437,6 +521,7 @@ def _summarize_match(path: Path) -> dict | None:
         "meta_path": str(_meta_path(path)) if _meta_path(path).is_file() else None,
         "ncm_side": _infer_play_side(path.name, meta),
         "opponent": _infer_opponent(path.name, meta),
+        "opponent_kind": meta.get("opponent_kind"),
         "quality": None,
         "learner_side": None,
         "opponent_side": None,
@@ -446,9 +531,10 @@ def _summarize_match(path: Path) -> dict | None:
         "label": path.name,
     }
     if meta:
+        opponent_quality = meta.get("opponent")
         row["quality"] = {
             "learner": meta.get("learner"),
-            "opponent": meta.get("opponent"),
+            "opponent": opponent_quality if isinstance(opponent_quality, dict) else None,
         }
         row["source"] = meta.get("source") or row["source"]
         row["label"] = meta.get("label") or row["label"]
@@ -456,10 +542,27 @@ def _summarize_match(path: Path) -> dict | None:
         row["opponent_side"] = meta.get("opponent_side") or row["opponent_side"]
         row["learner_persona"] = meta.get("learner_persona")
         row["opponent_persona"] = meta.get("opponent_persona")
-        row["started_at"] = meta.get("started_at") or row["started_at"]
-        row["finished_at"] = meta.get("finished_at") or row["finished_at"]
+        row["batch"] = meta.get("batch")
+        row["started_at"] = _display_time(meta.get("started_at")) or row["started_at"]
+        row["finished_at"] = _display_time(meta.get("finished_at")) or row["finished_at"]
+        if isinstance(meta.get("league"), dict):
+            row["league"] = meta["league"]
+            row["finished"] = bool(row["finished"] or meta["league"].get("finished"))
+            if meta["league"].get("winner") in ("A", "B"):
+                row["winner"] = meta["league"]["winner"]
         if meta.get("seconds") is not None:
             row["duration_s"] = meta.get("seconds")
+        # World Cup games carry neutral team labels and a winner that may have
+        # been resolved on board score even when the engine winner is empty.
+        if isinstance(meta.get("world_cup"), dict):
+            row["world_cup"] = meta["world_cup"]
+            winner_side = meta["world_cup"].get("winner_side")
+            if winner_side in ("A", "B"):
+                # Keep the dashboard's normal winner/learner_won fields
+                # consistent with the league's board-score decision.
+                row["winner"] = winner_side
+        if isinstance(meta.get("team_labels"), dict):
+            row["team_labels"] = meta["team_labels"]
     side = row.get("learner_side") or row.get("ncm_side")
     if side in ("A", "B"):
         row["learner_side"] = side
@@ -584,8 +687,9 @@ def games_payload() -> dict:
         ),
         reverse=True,
     )
+    batches = attach_batches(rows)
     reports = _reports()
-    return {"games": rows, "reports": reports, "count": len(rows)}
+    return {"games": rows, "reports": reports, "batches": batches, "count": len(rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +929,7 @@ def match_detail_payload(file_name: str) -> dict:
                 "label": arena_info.get("arena_label") or row.get("label"),
                 "arena_phase": arena_info.get("arena_phase"),
                 "arena_iteration": arena_info.get("arena_iteration"),
+                "arena_path": arena_info.get("arena_path"),
                 "quality": {
                     "learner": arena_info.get("learner"),
                     "opponent": arena_info.get("opponent_stats"),
@@ -840,6 +945,7 @@ def match_detail_payload(file_name: str) -> dict:
             )
     if row is not None:
         row = _decorate_display(dict(row))
+        attach_batches([row])
     quality = _quality_payload(meta, row)
     if not quality["learner"] and arena_info:
         quality["learner"] = arena_info.get("learner") or {}

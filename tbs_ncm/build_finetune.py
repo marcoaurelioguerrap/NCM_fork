@@ -49,10 +49,23 @@ def _action(row: dict) -> str:
 
 
 def _sample_original(
-    rows: list[dict], count: int, rng: random.Random, balance: bool
+    rows: list[dict],
+    count: int,
+    rng: random.Random,
+    balance: bool,
+    hold_ratio: float = 1.0,
 ) -> list[dict]:
     if count <= 0 or not rows:
         return []
+    if hold_ratio < 1.0:
+        holds = [row for row in rows if _action(row) == "h"]
+        others = [row for row in rows if _action(row) != "h"]
+        keep = int(len(holds) * max(0.0, hold_ratio))
+        if keep:
+            holds = rng.sample(holds, min(keep, len(holds)))
+        else:
+            holds = []
+        rows = others + holds
     if count >= len(rows):
         return list(rows)
     if not balance:
@@ -80,6 +93,7 @@ def build_persona(
     *,
     data_dir: Path,
     dagger_dir: Path | None,
+    dagger_name: str,
     out_dir: Path,
     original: int,
     dagger_weight: int,
@@ -87,14 +101,23 @@ def build_persona(
     repair_weight: float,
     seed: int,
     balance: bool,
+    hold_ratio: float,
 ) -> dict:
     """Write one persona's mixed fine-tune split and return its summary."""
     rng = random.Random(f"{seed}:{name}")
     source = data_dir / name
     original_rows = _read_rows(source / "train.jsonl")
     dagger_source = (dagger_dir or data_dir) / name
-    dagger_rows = _read_rows(dagger_source / "dagger.jsonl")
-    sampled = _sample_original(original_rows, original, rng, balance)
+    dagger_rows = _read_rows(dagger_source / dagger_name)
+    if hold_ratio < 1.0:
+        dagger_rows = [
+            row
+            for row in dagger_rows
+            if _action(row) != "h" or rng.random() < hold_ratio
+        ]
+    sampled = _sample_original(
+        original_rows, original, rng, balance, hold_ratio
+    )
 
     dagger: list[tuple[dict, str]] = []
     for row in dagger_rows:
@@ -117,6 +140,7 @@ def build_persona(
         "persona": name,
         "seed": seed,
         "balance": balance,
+        "hold_ratio": hold_ratio,
         "original_available": len(original_rows),
         "original_sampled": len(sampled),
         "dagger_available": len(dagger_rows),
@@ -151,6 +175,11 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="directory holding <persona>/dagger.jsonl (default: --data-dir)",
     )
+    parser.add_argument(
+        "--dagger-name",
+        default="dagger.jsonl",
+        help="filename to read under --dagger-dir, e.g. train.jsonl for push data",
+    )
     parser.add_argument("--out-dir", default=str(DATA_DIR / "personas"))
     parser.add_argument(
         "--original",
@@ -167,6 +196,12 @@ def main(argv: list[str] | None = None) -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="oversample rare actions in the original split",
+    )
+    parser.add_argument(
+        "--hold-ratio",
+        type=float,
+        default=1.0,
+        help="keep this fraction of hold rows (0.1 = push-heavy dataset)",
     )
     args = parser.parse_args(argv)
 
@@ -186,6 +221,7 @@ def main(argv: list[str] | None = None) -> int:
             name,
             data_dir=data_dir,
             dagger_dir=dagger_dir,
+            dagger_name=args.dagger_name,
             out_dir=out_dir,
             original=args.original,
             dagger_weight=args.dagger_weight,
@@ -193,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
             repair_weight=args.repair_weight,
             seed=args.seed,
             balance=args.balance,
+            hold_ratio=args.hold_ratio,
         )
         summaries.append(summary)
         print(
@@ -214,10 +251,12 @@ def main(argv: list[str] | None = None) -> int:
         "original": args.original,
         "data_dir": str(data_dir),
         "dagger_dir": str(dagger_dir or data_dir),
+        "dagger_name": args.dagger_name,
         "dagger_weight": args.dagger_weight,
         "fallback_weight": args.fallback_weight,
         "repair_weight": args.repair_weight,
         "balance": args.balance,
+        "hold_ratio": args.hold_ratio,
     }
     (out_dir / "finetune.summary.json").write_text(
         json.dumps(index, indent=2) + "\n", encoding="utf-8"

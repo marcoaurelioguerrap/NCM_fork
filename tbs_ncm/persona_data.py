@@ -28,7 +28,7 @@ from pathlib import Path
 from .common import DATA_DIR
 from .generate_data import MAX_STEPS_PER_TURN, dedupe, legal_lines, units_can_act
 from .monitor import RunLogger
-from .personas import PERSONAS, PersonaTeacher, get_persona, persona_names
+from .personas import PERSONAS, PersonaTeacher, get_persona, persona_names, push_persona
 
 import tbs_ncm.common  # noqa: F401  (adds the game repo to sys.path)
 
@@ -84,6 +84,7 @@ def play_persona_game(
     max_steps: int = MAX_STEPS_PER_TURN,
     record_legal: bool = False,
     teacher_seed: int | None = None,
+    push: bool = False,
 ) -> tuple[dict[str, list[dict]], dict]:
     """Play one persona-vs-persona game and return rows for both sides."""
     scenario = load_scenario(str(scenario_path))
@@ -91,8 +92,16 @@ def play_persona_game(
     state = new_game(scenario, SPECS)
     rules.start_game(state)
     teachers = {
-        "A": PersonaTeacher(persona_a, seed=(teacher_seed or seed) * 2 + 1),
-        "B": PersonaTeacher(persona_b, seed=(teacher_seed or seed) * 2 + 2),
+        "A": PersonaTeacher(
+            push_persona(persona_a) if push else persona_a,
+            seed=(teacher_seed or seed) * 2 + 1,
+            push=push,
+        ),
+        "B": PersonaTeacher(
+            push_persona(persona_b) if push else persona_b,
+            seed=(teacher_seed or seed) * 2 + 2,
+            push=push,
+        ),
     }
     persona_of = {"A": persona_a, "B": persona_b}
     rows: dict[str, list[dict]] = {name: [] for name in {persona_a, persona_b}}
@@ -160,7 +169,7 @@ def play_persona_game(
 
 
 def _job(args: tuple) -> tuple[dict[str, list[dict]], list[dict]]:
-    personas, seeds, scenario_paths, max_turns, max_steps, record_legal = args
+    personas, seeds, scenario_paths, max_turns, max_steps, record_legal, push = args
     rows: dict[str, list[dict]] = {name: [] for name in set(personas)}
     games: list[dict] = []
     for index, seed in enumerate(seeds):
@@ -173,6 +182,7 @@ def _job(args: tuple) -> tuple[dict[str, list[dict]], list[dict]]:
             max_turns=max_turns,
             max_steps=max_steps,
             record_legal=record_legal,
+            push=push,
         )
         for name, items in game_rows.items():
             rows.setdefault(name, []).extend(items)
@@ -274,6 +284,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also store every legal order per state (large; use for val/test only)",
     )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="use the push-biased variant of every persona",
+    )
     parser.add_argument("--append", action="store_true", help="merge with existing split files")
     parser.add_argument(
         "--hold-cap",
@@ -320,7 +335,16 @@ def main(argv: list[str] | None = None) -> int:
                 for index in range(games)
             ]
             jobs.append(
-                (name, pair, seeds, paths, args.max_turns, args.max_steps, args.record_legal)
+                (
+                    name,
+                    pair,
+                    seeds,
+                    paths,
+                    args.max_turns,
+                    args.max_steps,
+                    args.record_legal,
+                    args.push,
+                )
             )
 
     total_games = sum(len(job[2]) for job in jobs)
@@ -346,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                 results = []
                 with ProcessPoolExecutor(max_workers=args.workers) as pool:
                     futures = {
-                        pool.submit(_job, (job[1], job[2], [str(p) for p in job[3]], job[4], job[5], job[6])): job
+                        pool.submit(_job, (job[1], job[2], [str(p) for p in job[3]], job[4], job[5], job[6], job[7])): job
                         for job in jobs
                     }
                     for future in as_completed(futures):
@@ -360,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {job[1][0]} vs {job[1][1]} ({split}): {sum(len(v) for v in rows.values())} rows")
             else:
                 done_games = 0
-                for name, pair, seeds, paths, max_turns, max_steps, record_legal in jobs:
+                for name, pair, seeds, paths, max_turns, max_steps, record_legal, push in jobs:
                     rows: dict[str, list[dict]] = {}
                     games: list[dict] = []
                     for index, seed in enumerate(seeds):
@@ -372,6 +396,7 @@ def main(argv: list[str] | None = None) -> int:
                             max_turns=max_turns,
                             max_steps=max_steps,
                             record_legal=record_legal,
+                            push=push,
                         )
                         for persona, items in game_rows.items():
                             rows.setdefault(persona, []).extend(items)

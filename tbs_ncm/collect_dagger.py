@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .arena import load_agent
 from .common import ARTIFACT_DIR, DATA_DIR
-from .personas import PersonaTeacher, persona_names
+from .personas import PersonaTeacher, persona_names, push_persona
 from .selfplay import collect_game, dedupe, write_rows
 
 import tbs_ncm.common  # noqa: F401
@@ -73,6 +73,11 @@ def main(argv: list[str] | None = None) -> int:
         "--resume",
         action="store_true",
         help="skip personas whose dagger.jsonl already exists",
+    )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="label with the push-biased variant of each persona",
     )
     args = parser.parse_args(argv)
 
@@ -123,7 +128,11 @@ def main(argv: list[str] | None = None) -> int:
             map_path = maps[(persona_index + game) % len(maps)]
             seed = args.seed_base + persona_index * 100 + game
             side = "B" if game % 2 == 0 else "A"
-            teacher = PersonaTeacher(name, seed=seed)
+            teacher = PersonaTeacher(
+                push_persona(name) if args.push else name,
+                seed=seed,
+                push=args.push,
+            )
             rows, stats = collect_game(
                 learner,
                 opponent,
@@ -160,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             "games": games,
             "maps": [item.stem for item in maps],
             "opponent_mode": args.opponent_mode,
+            "push": args.push,
             "rows": len(persona_rows),
             "fallback_teacher_rows": fallback_rows,
             "kinds": dict(Counter(row["kind"] for row in persona_rows)),

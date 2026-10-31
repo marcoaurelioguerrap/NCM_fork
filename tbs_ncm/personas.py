@@ -16,10 +16,11 @@ from __future__ import annotations
 import hashlib
 import random
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from tbs.agents.codec import encode_order, encode_state
+from tbs.agents.ferry import plan_ferry
 from tbs.agents.protocol import AgentPlan, TurnRequest
 from tbs.engine.hexgrid import hex_distance
 
@@ -29,6 +30,8 @@ __all__ = [
     "PersonaTeacher",
     "get_persona",
     "persona_names",
+    "push_persona",
+    "random_persona",
 ]
 
 
@@ -179,6 +182,100 @@ def get_persona(name: str) -> Persona:
         raise KeyError(f"unknown persona {name!r}; choose from {persona_names()}") from None
 
 
+def push_persona(name: str) -> Persona:
+    """A pushing variant of a persona: no retreat, no home hold, HQ-focused.
+
+    The build mix and target preferences stay intact, so the aggressive/armor
+    styles still mass tanks, infantry still masses infantry, etc.  The changes
+    remove the behaviours that made the clones sit on their starting side:
+    defensive radius, retreat, home bias, standoff, and voluntary holds.
+    """
+    persona = get_persona(name)
+    return replace(
+        persona,
+        build_prob=1.0,
+        build_forward=0.85,
+        attack_prob=1.0,
+        attack_threshold=0.0,
+        risk_aversion=min(persona.risk_aversion, 0.15),
+        hq_bonus=max(persona.hq_bonus, 1.0),
+        capture_prob=1.0,
+        capture_first=True,
+        defense_radius=0,
+        retreat_hp=0.0,
+        home_bias=0.0,
+        hold_prob=0.0,
+        enemy_bias=max(persona.enemy_bias, 1.2),
+        enemy_hq_bias=max(persona.enemy_hq_bias, 1.4),
+        site_bias=max(persona.site_bias, 1.0),
+        objective_bias=max(persona.objective_bias, 0.8),
+        standoff=0,
+        noise=0.05,
+    )
+
+
+def random_persona(seed: int, name: str | None = None) -> Persona:
+    """A seeded, randomized conventional-AI policy.
+
+    The same seed always yields the same opponent, which makes training and
+    league games reproducible.  The random draw covers production, attack
+    appetite, risk, target priorities, capture behaviour, defence radius,
+    standoff and movement bias.
+    """
+    rng = random.Random(seed)
+    archetype = rng.choice(("armor", "infantry", "artillery", "air", "balanced"))
+    if archetype == "armor":
+        base = {"tank": 1.0, "artillery": 0.45, "aa_missile": 0.25}
+    elif archetype == "infantry":
+        base = {"infantry": 1.0, "artillery": 0.25, "aa_missile": 0.2}
+    elif archetype == "artillery":
+        base = {"artillery": 1.0, "infantry": 0.5, "aa_missile": 0.2}
+    elif archetype == "air":
+        base = {"helicopter": 1.0, "attack_plane": 0.8, "bomber": 0.4}
+    else:
+        types = rng.sample(
+            ("infantry", "tank", "artillery", "aa_missile", "apc", "helicopter", "attack_plane"),
+            rng.randint(2, 4),
+        )
+        base = {unit: rng.uniform(0.3, 1.0) for unit in types}
+    build_weights = {
+        unit: round(weight * rng.uniform(0.6, 1.3), 2)
+        for unit, weight in base.items()
+    }
+    target_bonus = {
+        unit: round(rng.uniform(0.0, 1.4), 2)
+        for unit in ("infantry", "tank", "artillery", "apc", "hq")
+    }
+    capture_types = tuple(
+        rng.sample(("infantry", "tank", "apc"), rng.randint(0, 2))
+    )
+    return Persona(
+        name=name or f"heuristic-{seed}",
+        title=f"Randomized conventional AI ({archetype})",
+        build_weights=build_weights,
+        build_prob=rng.uniform(0.4, 1.0),
+        build_forward=rng.uniform(0.1, 0.9),
+        attack_prob=rng.uniform(0.6, 1.0),
+        attack_threshold=0.0,
+        risk_aversion=rng.uniform(0.0, 0.8),
+        target_bonus=target_bonus,
+        hq_bonus=rng.uniform(0.0, 2.0),
+        capture_prob=rng.uniform(0.6, 1.0),
+        capture_first=rng.random() < 0.5,
+        capture_unit_types=capture_types,
+        defense_radius=rng.choice((0, 0, 4, 5, 6, 7)),
+        retreat_hp=rng.uniform(0.0, 0.5),
+        home_bias=rng.uniform(0.0, 0.5),
+        hold_prob=rng.uniform(0.0, 0.1),
+        enemy_bias=rng.uniform(0.6, 1.8),
+        enemy_hq_bias=rng.uniform(0.0, 1.8),
+        site_bias=rng.uniform(0.4, 1.9),
+        objective_bias=rng.uniform(0.0, 1.5),
+        standoff=rng.choice((0, 0, 0, 2, 3, 4)),
+        noise=rng.uniform(0.05, 0.25),
+    )
+
+
 class PersonaTeacher:
     """A scripted policy with the same one-order-per-step interface as NcmAgent.
 
@@ -189,9 +286,10 @@ class PersonaTeacher:
 
     name = "persona"
 
-    def __init__(self, persona: Persona | str, seed: int = 0):
+    def __init__(self, persona: Persona | str, seed: int = 0, push: bool = False):
         self.persona = get_persona(persona) if isinstance(persona, str) else persona
         self.name = self.persona.name
+        self.push = push
         self.rng = random.Random(seed)
         self._salt = int.from_bytes(
             hashlib.blake2b(self.persona.name.encode("utf-8"), digest_size=8).digest(),
@@ -286,6 +384,14 @@ class PersonaTeacher:
                 self._built = True
                 return order
 
+        # A persona still travels by transport.  The engine's ferry hints are
+        # the same ones the greedy teacher and the LLM view use; returning the
+        # first staged order lets the stepwise coordinator refresh the view and
+        # issue the next move/load/sail/unload in the following step.
+        ferry = plan_ferry(view)
+        if ferry.orders:
+            return dict(ferry.orders[0])
+
         candidates = [
             unit_id
             for unit_id, summary in actions.items()
@@ -294,6 +400,7 @@ class PersonaTeacher:
             and not summary.get("loaded_in")
             and not summary.get("new_unit")
             and unit_id in own_by_id
+            and unit_id not in ferry.claimed
         ]
         if not candidates:
             return None
@@ -318,6 +425,7 @@ class PersonaTeacher:
             if self.rng.random() < 0.25:
                 self.rng.shuffle(candidates)
 
+        fallback_hold = None
         for unit_id in candidates:
             summary = actions[unit_id]
             unit = own_by_id[unit_id]
@@ -326,8 +434,12 @@ class PersonaTeacher:
                 enemy_positions, capturable, objectives,
             )
             if options is not None:
+                if self.push and str(options.get("action")) == "hold":
+                    if fallback_hold is None:
+                        fallback_hold = options
+                    continue
                 return options
-        return None
+        return fallback_hold
 
     def _unit_options(
         self,
@@ -384,13 +496,17 @@ class PersonaTeacher:
         if hold_available and self.rng.random() < persona.hold_prob:
             return {"action": "hold", "unit": unit_id}
 
-        # Transports are otherwise dead weight: the scripted greedy teacher
-        # never loads or unloads.  Doing it here also adds the only load/unload
-        # examples the NCM will ever see.
-        loads = options.get("load") or []
+        # Sea transports are handled by the ferry planner above.  These random
+        # load/unload branches remain for land transports (truck/APC), and they
+        # add some action coverage the greedy teacher does not produce.
+        loads = [
+            str(item)
+            for item in (options.get("load") or [])
+            if by_id.get(str(item), {}).get("move", 0) > 0
+        ]
         if loads and self.rng.random() < 0.55:
             cargo = min(
-                (str(item) for item in loads),
+                loads,
                 key=lambda item: (
                     _distance_to(by_id.get(item, {}).get("pos"), enemy_positions),
                     item,

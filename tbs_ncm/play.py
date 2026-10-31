@@ -65,6 +65,8 @@ def _ncm_stats(agent: NcmAgent) -> dict:
         "samples": agent.samples,
         "generated": agent.generated,
         "repaired": agent.repaired,
+        "constrained": agent.constrained,
+        "tactical": agent.tactical,
         "fallbacks": agent.fallbacks,
         "illegal": agent.illegal,
         "rejected": agent.rejected,
@@ -74,6 +76,11 @@ def _ncm_stats(agent: NcmAgent) -> dict:
         "repairs": dict(agent.repairs),
         "model_orders": agent.model_orders,
         "fallback_rate": agent.fallbacks / steps,
+        "constrained_share": agent.constrained / steps,
+        "tactical_share": agent.tactical / steps,
+        "legal_share": (
+            agent.generated + agent.repaired + agent.constrained
+        ) / steps,
         "model_share": agent.model_orders / steps,
         "fallback_reasons": dict(Counter(agent.fallback_reasons)),
     }
@@ -90,6 +97,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint-dir", default=str(ARTIFACT_DIR))
     parser.add_argument("--fallback", choices=("greedy", "persona"), default="greedy")
     parser.add_argument("--persona", default="", help="persona name for a persona fallback")
+    parser.add_argument(
+        "--decode",
+        choices=("sample", "legal"),
+        default="legal",
+        help="sample: free generation + repair; legal: rank the view's legal orders",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--shadow", action="store_true", help="let the NCM agent play both sides")
     parser.add_argument("--scenario", help="scenario JSON path (default: bundled skirmish)")
@@ -152,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         temperature=args.ncm_temperature,
         retries=args.ncm_retries,
         retry_temperature=args.ncm_retry_temperature,
+        decode=args.decode,
         fallback=fallback,
     )
     logger = JsonlLogger(args.llm_log) if args.llm_log else None

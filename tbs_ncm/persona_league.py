@@ -155,6 +155,8 @@ def _aggregate(matches: list[dict], name: str) -> dict:
     enemy_distance = home_distance = 0.0
     geometry = 0
     orders = steps = fallbacks = model_orders = generated = repaired = 0
+    constrained = 0
+    tactical = 0
     rejected = state_too_long = 0
     repairs: Counter[str] = Counter()
     fallback_reasons: Counter[str] = Counter()
@@ -182,6 +184,8 @@ def _aggregate(matches: list[dict], name: str) -> dict:
         model_orders += stats.get("model_orders", 0)
         generated += stats.get("generated", 0)
         repaired += stats.get("repaired", 0)
+        constrained += stats.get("constrained", 0)
+        tactical += stats.get("tactical", 0)
         fallbacks += stats.get("fallbacks", 0)
         rejected += stats.get("rejected", 0)
         state_too_long += stats.get("state_too_long", 0)
@@ -208,6 +212,8 @@ def _aggregate(matches: list[dict], name: str) -> dict:
         "orders": orders,
         "generated": generated,
         "repaired": repaired,
+        "constrained": constrained,
+        "tactical": tactical,
         "model_orders": model_orders,
         "fallbacks": fallbacks,
         "rejected": rejected,
@@ -218,6 +224,9 @@ def _aggregate(matches: list[dict], name: str) -> dict:
         "fallback_rate_per_order": fallbacks / max(1, orders),
         "generated_share": generated / total,
         "repaired_share": repaired / total,
+        "constrained_share": constrained / total,
+        "tactical_share": tactical / total,
+        "legal_share": (generated + repaired + constrained) / total,
         "model_share": model_orders / total,
         "state_too_long_rate": state_too_long / total,
         "actions": {key: actions.get(key, 0) / total for key in ACTION_KEYS},
@@ -259,6 +268,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--fallback", choices=("persona", "greedy"), default="persona")
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--decode",
+        choices=("sample", "legal"),
+        default="legal",
+        help="sample: free generation + repair; legal: rank the view's legal orders",
+    )
     parser.add_argument("--out-dir", default=str(LEAGUE_DIR))
     parser.add_argument(
         "--match-dir",
@@ -320,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                 generator=args.generator or None,
                 fallback=args.fallback,
                 persona=name,
+                decode=args.decode,
             )
 
     if args.pairs:
@@ -400,7 +416,8 @@ def main(argv: list[str] | None = None) -> int:
                                 "learner_persona": name_a,
                                 "opponent_persona": name_b,
                                 "personas": {side: name_a, other: name_b},
-                                "opponent": "ncm",
+                                "opponent_kind": "ncm",
+                                "batch": out_dir.name,
                             }
                         )
                         meta_path.write_text(
@@ -429,6 +446,9 @@ def main(argv: list[str] | None = None) -> int:
                         score_delta=match["score_delta"],
                         generated=match["learner"]["generated"],
                         repaired=match["learner"]["repaired"],
+                        constrained=match["learner"].get("constrained", 0),
+                        tactical=match["learner"].get("tactical", 0),
+                        legal_share=match["learner"].get("legal_share", 0.0),
                         fallbacks=match["learner"]["fallbacks"],
                         seconds=round(elapsed, 1),
                     )
@@ -472,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         "games_per_map": args.games_per_map,
         "matches": len(matches),
         "fallback": args.fallback,
+        "decode": args.decode,
         "prefix_len": args.prefix_len,
         "generator": args.generator or "generator.pt",
         "retries": args.retries,
@@ -532,19 +553,25 @@ def main(argv: list[str] | None = None) -> int:
         "# Persona league",
         "",
         f"{len(matches)} games on {len(maps)} maps, fallback `{args.fallback}`, "
-        f"generator `{args.generator or 'generator.pt'}`, "
+        f"decode `{args.decode}`, generator `{args.generator or 'generator.pt'}`, "
         f"prefix `{args.prefix_len}`, retries `{args.retries}`.",
         "",
-        "| persona | W-L-U | win% | score | attack% | build% | hold% | exact% | model% | fallback% | context% | enemy dist | style dist | model style |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "`exact` = raw generated legal; `constrained` = model-ranked legal; "
+        "`legal` = exact+constrained+repaired (model-controlled); "
+        "`model` = all model orders; `fallback` = scripted teacher.",
+        "",
+        "| persona | W-L-U | win% | score | attack% | capture% | build% | hold% | exact% | constrained% | tactical% | legal% | model% | fallback% | context% | enemy dist | style dist | model style |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name in names:
         row = aggregates[name]
         lines.append(
             f"| {name} | {row['wins']}-{row['losses']}-{row['unfinished']} | "
             f"{row['win_rate']:.0%} | {row['avg_score_delta']:+.1f} | "
-            f"{row['actions'].get('attack', 0):.0%} | {row['actions'].get('build', 0):.0%} | "
-            f"{row['actions'].get('hold', 0):.0%} | {row['generated_share']:.0%} | "
+            f"{row['actions'].get('attack', 0):.0%} | {row['actions'].get('capture', 0):.0%} | "
+            f"{row['actions'].get('build', 0):.0%} | {row['actions'].get('hold', 0):.0%} | "
+            f"{row['generated_share']:.0%} | {row['constrained_share']:.0%} | "
+            f"{row['tactical_share']:.0%} | {row['legal_share']:.0%} | "
             f"{row['model_share']:.0%} | {row['fallback_rate']:.0%} | "
             f"{row['state_too_long_rate']:.0%} | "
             f"{row['mean_enemy_distance'] if row['mean_enemy_distance'] is not None else 0:.1f} | "

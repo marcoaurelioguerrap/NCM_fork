@@ -23,6 +23,7 @@ __all__ = [
     "legal_lines",
     "line_similarity",
     "nearest_legal_order",
+    "rank_legal_orders",
 ]
 
 ACTION_CODES = frozenset("mabcluh")
@@ -155,3 +156,48 @@ def nearest_legal_order(
     except CodecError:
         return None
     return NearestLegal(best_line, order, best_score)
+
+
+def rank_legal_orders(
+    view: dict,
+    line: str,
+    *,
+    allowed: list[str] | tuple[str, ...] | set[str] | None = None,
+    limit: int = 8,
+) -> list[NearestLegal]:
+    """Return the ``limit`` legal lines most similar to a sampled line.
+
+    The action is kept whenever the view offers it, and a unit id filters the
+    shortlist further when one is present.  This keeps a constrained decode
+    inside the model's chosen action/unit instead of drifting to an unrelated
+    legal order with a better character score.
+    """
+    candidates = list(allowed) if allowed is not None else legal_lines(view)
+    line = str(line or "").strip()
+    if not line or not candidates or limit <= 0:
+        return []
+
+    tokens = line.split()
+    first = tokens[0] if tokens else ""
+    if first in ACTION_CODES:
+        same_action = [candidate for candidate in candidates if candidate.split()[0] == first]
+        if same_action:
+            candidates = same_action
+            if first != "b" and len(tokens) > 1:
+                same_unit = [
+                    candidate
+                    for candidate in candidates
+                    if len(candidate.split()) > 1 and candidate.split()[1] == tokens[1]
+                ]
+                if same_unit:
+                    candidates = same_unit
+
+    ranked: list[NearestLegal] = []
+    for candidate in candidates:
+        try:
+            order = decode_order(candidate)
+        except CodecError:
+            continue
+        ranked.append(NearestLegal(candidate, order, line_similarity(line, candidate)))
+    ranked.sort(key=lambda item: (-item.score, item.line))
+    return ranked[:limit]

@@ -54,6 +54,7 @@ def load_agent(
     generator: str | Path | None = None,
     fallback: str = "greedy",
     persona: str | None = None,
+    decode: str = "sample",
 ) -> NcmAgent:
     """Load one checkpoint dir containing ``tokenizer.pt`` and ``generator.pt``.
 
@@ -82,6 +83,7 @@ def load_agent(
         retries=retries,
         retry_temperature=retry_temperature,
         fallback=recovery,
+        decode=decode,
     )
 
 
@@ -92,6 +94,8 @@ def reset_agent(agent: NcmAgent) -> None:
     agent.generated = 0
     agent.repaired = 0
     agent.repaired_samples = 0
+    agent.constrained = 0
+    agent.tactical = 0
     agent.fallbacks = 0
     agent.illegal = 0
     agent.rejected = 0
@@ -99,6 +103,7 @@ def reset_agent(agent: NcmAgent) -> None:
     agent.state_too_long = 0
     agent.generation_errors = 0
     agent.lines.clear()
+    agent.constrained_lines.clear()
     agent.fallback_reasons.clear()
     agent.repairs.clear()
     agent.actions.clear()
@@ -123,6 +128,8 @@ def _agent_stats(agent: NcmAgent) -> dict:
         "generated": agent.generated,
         "repaired": agent.repaired,
         "repaired_samples": agent.repaired_samples,
+        "constrained": agent.constrained,
+        "tactical": agent.tactical,
         "fallbacks": agent.fallbacks,
         "illegal": agent.illegal,
         "rejected": agent.rejected,
@@ -159,6 +166,11 @@ def _agent_stats(agent: NcmAgent) -> dict:
         "fallback_rate_per_order": agent.fallbacks / order_total,
         "generated_share": agent.generated / total,
         "repaired_share": agent.repaired / total,
+        "constrained_share": agent.constrained / total,
+        "tactical_share": agent.tactical / total,
+        "legal_share": (
+            agent.generated + agent.repaired + agent.constrained
+        ) / total,
         "model_share": agent.model_orders / total,
         "sample_legal_rate": agent.generated / max(1, agent.samples),
         "fallback_reasons": _reason_counts(agent),
@@ -509,6 +521,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prefix-len", type=int, default=2048)
     parser.add_argument("--fallback", choices=("greedy", "persona"), default="greedy")
     parser.add_argument("--persona", default="", help="persona name for a persona fallback")
+    parser.add_argument(
+        "--decode",
+        choices=("sample", "legal"),
+        default="legal",
+        help="sample: free generation + repair; legal: rank the view's legal orders",
+    )
     parser.add_argument("--scenario", default="", help="scenario JSON path (default: first map)")
     parser.add_argument("--max-turns", type=int, default=MAX_TURNS)
     parser.add_argument("--max-steps", type=int, default=MAX_STEPS_PER_TURN)
@@ -529,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         prefix_len=args.prefix_len,
         fallback=args.fallback,
         persona=args.persona or None,
+        decode=args.decode,
     )
     opponent = load_agent(
         args.opponent_checkpoint_dir,
@@ -539,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
         prefix_len=args.prefix_len,
         fallback=args.fallback,
         persona=args.persona or None,
+        decode=args.decode,
     )
     seeds = _seeds(args.seed_base, args.games)
     run = (

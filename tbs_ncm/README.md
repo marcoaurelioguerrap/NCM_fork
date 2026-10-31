@@ -1,10 +1,26 @@
 # NCM player for Turn-Based Strategy
 
-This directory trains and runs an NCM player for the Advance-Wars-style engine at
-`TBS_GAME_REPO` (default
-`C:\Users\marco\OneDrive\Documentos\opencode_code\turn_based_strategy_vibe`).
-It is separate from the game repository so torch never leaks into the engine's
-stdlib-only test suite.
+This directory trains and runs an NCM player for the Advance-Wars-style engine
+in the separate game repository,
+[marcoaurelioguerrap/turn_based_strategy_vibe](https://github.com/marcoaurelioguerrap/turn_based_strategy_vibe).
+Point `TBS_GAME_REPO` at that checkout; it is separate from the game repository
+so torch never leaks into the engine's stdlib-only test suite.
+
+## Quickstart
+
+Download the base checkpoint from the [fork release](https://github.com/marcoaurelioguerrap/NCM_fork/releases),
+extract it into `artifacts/tbs`, and point `TBS_GAME_REPO` at the game checkout:
+
+```powershell
+$env:TBS_GAME_REPO = "..\turn_based_strategy_vibe"
+python -m tbs_ncm.play --opponent greedy --ncm-side B --seed 7
+python -m tbs_ncm.play_ui --no-menu --agent-side B
+```
+
+The base release contains the tokenizer, the base generator and `config.yaml`.
+The five persona checkpoints used in the league are not part of the base release.
+The tokenizer is shared, so a persona checkpoint only needs its own
+`generator.pt` and `config.yaml`.
 
 ## Why a new tokenizer
 
@@ -59,7 +75,21 @@ The default run (seeds 1-200 train, 10000-10019 validation, 20000-20019 test):
 | test | 5,425 | 20 |
 
 Action mix in train: 23,715 moves, 19,590 attacks, 7,806 builds, 3,414 captures.
-Greedy never loads, unloads or holds, so those actions are not in the dataset yet.
+The original border-skirmish run predates the ferry teacher: greedy never loaded,
+unloaded or held there, so those actions are absent from that split.
+
+For island maps, use the game repository's ferry-aware generator instead of
+regenerating the border-skirmish line:
+
+```powershell
+py scripts/generate_ferry_data.py --maps archipelago,archipelago_m --games 50 `
+  --amphibious-repeat 4 --out tbs_ncm/data/ferry.jsonl
+```
+
+It writes rows with an `amphibious` flag on load/unload orders, so a fine-tune
+can oversample the crossings the original dataset never contained.  The
+scripted `GreedyAgent` and `PersonaTeacher` both follow the engine's `ferry`
+hints now, including the pickup, sail, landing and empty-transport return.
 
 State text is the compact codec (about 500 GPT-2 tokens, max 870 in this run;
 prefixes longer than `prefix_len` are skipped at training time).
@@ -102,7 +132,8 @@ parseability; the best checkpoint is saved to `artifacts/tbs/generator.pt`.
 | Generator, 500 held-out states | 25.2% exact, 99.4% parseable |
 | Inference | 60 ms per order on the 5070 Ti |
 | NCM (B) vs greedy (A), seed 7, 40-turn cap | **NCM victory by capturing A's HQ, turn 25** |
-| NCM (B) vs 74B LLM (A), seed 7, 20-turn cap | **NCM victory by capturing A's HQ, turn 18** |
+| NCM (B) vs 74B Nemotron (A), seed 7, 20-turn cap | **NCM victory by capturing A's HQ, turn 18** (earlier run) |
+| 60-game all-AI league vs Qwen3.8-27B IQ3_S | NCM Vanguard 17-13, NCM Siege 8-22, Qwen 16-14 (persona checkpoints) |
 
 In the greedy match the NCM side submitted 78 orders exactly as generated, 86
 after the legalizer snapped a coordinate/target to a legal option for the chosen
@@ -237,18 +268,28 @@ Headless against greedy:
 python -m tbs_ncm.play --opponent greedy --ncm-side B --seed 7
 ```
 
-Against the local 74B (start Unsloth Studio first):
+Against the local Qwen3.8-27B baseline used in the 60-game league (start
+Unsloth Studio first; the server lists the loaded `IQ3_S` weights under the id
+without the quant suffix):
 
 ```
-$env:TBS_LLM_MODEL = "unsloth/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-GGUF"
+$env:TBS_LLM_MODEL = "ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
 $env:TBS_LLM_API_KEY = "<the key Unsloth prints>"
 python -m tbs_ncm.play --opponent llm --ncm-side B --seed 7
 ```
 
+The earlier 74B Nemotron match in the table above is a historical run; the
+current league baseline is the Qwen model.
+
 The NCM side plays one generated order per step through
 `run_turn_stepwise`. It builds the legal set from the same view an LLM sees
 (affordable builds and units with a usable action), decodes each sample, and
-accepts an exact legal order immediately. Otherwise it resamples up to six
+accepts an exact legal order immediately. On maps where the view exposes a
+`ferry` operation, `NcmAgent` first applies the same deterministic ferry
+advisor as the scripted teachers; the released checkpoint maps `l`/`u` to `m`
+even after a short fine-tune, so the advisor is what guarantees the multi-turn
+crossing while the model keeps every other decision. A longer fine-tune can
+internalize the action later. Otherwise it resamples up to six
 times and keeps the best candidate by repair kind and snap distance: same-unit
 coordinate/target repair, same-unit alternate action, unit-id snap, then a
 global nearest-legal line. Fuzzy unit ids only get a same-action repair, so a
@@ -302,8 +343,9 @@ python -m tbs_ncm.dashboard --open --port 8766
 The page polls every 2 s. It is standard library only: no dependency, no build
 step, no CDN.
 
-The page has two tabs. **Training** keeps the run explorer; **Games** is a
-browser over every saved match plus the arena and self-play summaries.
+The page has three tabs. **Training** keeps the run explorer; **Games** is a
+browser over every saved match plus the arena and self-play summaries;
+**Overview** aggregates every saved game into cross-game plots.
 
 | panel | shows |
 |---|---|
@@ -315,7 +357,16 @@ browser over every saved match plus the arena and self-play summaries.
 | Games per run | win/loss, score delta, turns, orders and NCM order quality for `arena`, `vs_ncm` and `selfplay` runs |
 | Iterations (`vs_ncm`) | baseline vs post win rate and score delta from `vs_ncm/*/report.json` |
 | Games tab | search/filter every saved game, result, learner side, score delta and generated/repaired/fallback counts |
+| Overview tab | all saved games: results by day and scenario, final-score and game-length histograms, rolling order-quality shares, and evaluation-batch comparisons (outcome, win rate, score delta, provenance, action mix and game length per run) |
 | Game detail | per-turn board-score/unit/HP/site/fund charts, objective and kill markers, action-by-action SVG board replay, and NCM/learner quality per turn |
+
+The Overview tab treats one evaluation or league report as a **batch**. It reads
+`artifacts/tbs/personas/*/report.json` and the `vs_ncm` arena/self-play summaries,
+matches saved games to the run that produced them, and shows the same outcome,
+score, provenance, action-mix and turn-length metrics per batch. A batch selector
+limits the charts to the latest 8, latest 12 (default), or all runs. Standalone
+play games with no run report are still included in the all-games charts but are
+excluded from the batch charts.
 
 The Games tab replays the accepted orders in each `*.orders.json` through the
 game engine, so a saved game becomes a scrubable board without re-running the

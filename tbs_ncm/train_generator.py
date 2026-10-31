@@ -19,6 +19,7 @@ import math
 import random
 import sys
 import time
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -216,6 +217,17 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0, help="use only the first N training rows")
     parser.add_argument("--eval-limit", type=int, default=128)
     parser.add_argument("--eval-generate", type=int, default=128)
+    parser.add_argument(
+        "--action-weight",
+        type=float,
+        default=1.0,
+        help="loss multiplier for the first order character (the action code)",
+    )
+    parser.add_argument(
+        "--balance-actions",
+        action="store_true",
+        help="inverse-sqrt class weights for the first action character",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--config", default="", help="model config path (default tbs_ncm/config.yaml)")
     parser.add_argument(
@@ -271,6 +283,26 @@ def main() -> int:
     train_rows, train_skipped = filter_prefixes(train_rows, gpt2, prefix_len)
     val_rows, val_skipped = filter_prefixes(val_rows, gpt2, prefix_len)
     print(f"skipped overlong prefixes: train {train_skipped}, validation {val_skipped}")
+
+    action_weights: dict[str, float] = {}
+    if args.balance_actions:
+        counts = Counter(str(row.get("target", ""))[:1] for row in train_rows)
+        counts.pop("", None)
+        total = sum(counts.values())
+        if counts:
+            raw = {
+                char: math.sqrt(total / (len(counts) * count))
+                for char, count in counts.items()
+            }
+            mean = sum(raw.values()) / len(raw)
+            action_weights = {char: weight / mean for char, weight in raw.items()}
+            print(
+                "action weights: "
+                + ", ".join(
+                    f"{char}={action_weights[char]:.3f} ({counts[char]})"
+                    for char in sorted(counts)
+                )
+            )
 
     val_legal_rows = sum(1 for row in val_rows if isinstance(row.get("legal"), list))
     if args.select == "legal" and not val_legal_rows:
@@ -391,9 +423,28 @@ def main() -> int:
                     pad_mask = prefix == cfg.model.prefix_pad_token_id
                     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.device == "cuda"):
                         logits = net(x, prefix_ids=prefix, prefix_pad_mask=pad_mask)
-                        loss = F.cross_entropy(
-                            logits.reshape(-1, logits.shape[-1]), codes.reshape(-1)
-                        )
+                        token_loss = F.cross_entropy(
+                            logits.reshape(-1, logits.shape[-1]),
+                            codes.reshape(-1),
+                            reduction="none",
+                        ).view(codes.shape)
+                        if args.action_weight != 1.0 or action_weights:
+                            # The first code is the order's action mnemonic.  It
+                            # is the rare, decisive part of the line; the model
+                            # otherwise collapses it to "m" and copies the args.
+                            weights = torch.ones_like(token_loss, dtype=torch.float32)
+                            first_chars = target[:, 0].tolist()
+                            weights[:, 0] = torch.tensor(
+                                [
+                                    action_weights.get(tokenizer.itos[int(char)], 1.0)
+                                    for char in first_chars
+                                ],
+                                dtype=torch.float32,
+                                device=weights.device,
+                            ) * float(args.action_weight)
+                            loss = (token_loss * weights).sum() / weights.sum()
+                        else:
+                            loss = token_loss.mean()
                     (loss / args.grad_accum).backward()
                     value = loss.detach().item()
                     running += value
