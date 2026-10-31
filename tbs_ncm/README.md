@@ -12,15 +12,24 @@ Download the base checkpoint from the [fork release](https://github.com/marcoaur
 extract it into `artifacts/tbs`, and point `TBS_GAME_REPO` at the game checkout:
 
 ```powershell
+git clone https://github.com/marcoaurelioguerrap/turn_based_strategy_vibe.git
+git clone https://github.com/marcoaurelioguerrap/NCM_fork.git
+cd NCM_fork
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt pygame-ce
+# NVIDIA Windows: install the CUDA torch wheel first; see SETUP-LOCAL.md.
+# Extract the release ZIP into artifacts\tbs before running the player.
 $env:TBS_GAME_REPO = "..\turn_based_strategy_vibe"
 python -m tbs_ncm.play --opponent greedy --ncm-side B --seed 7
 python -m tbs_ncm.play_ui --no-menu --agent-side B
 ```
 
-The base release contains the tokenizer, the base generator and `config.yaml`.
-The five persona checkpoints used in the league are not part of the base release.
-The tokenizer is shared, so a persona checkpoint only needs its own
-`generator.pt` and `config.yaml`.
+The base release contains the tokenizer, the base generator, `config.yaml`, the
+learned ferry action selector (`action_clf.pt`, optional) and a held-out
+evaluation sample (`test_sample.jsonl`). The five persona checkpoints used in
+the league are not part of the base release. The tokenizer is shared, so a
+persona checkpoint only needs its own `generator.pt` and `config.yaml`.
 
 ## Why a new tokenizer
 
