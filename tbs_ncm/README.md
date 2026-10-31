@@ -92,13 +92,13 @@ regenerating the border-skirmish line:
 
 ```powershell
 py scripts/generate_ferry_data.py --maps archipelago,archipelago_m --games 50 `
-  --amphibious-repeat 4 --out tbs_ncm/data/ferry.jsonl
+  --amphibious-repeat 20 --out tbs_ncm/data/ferry.jsonl
 ```
 
-It writes rows with an `amphibious` flag on load/unload orders, so a fine-tune
-can oversample the crossings the original dataset never contained.  The
-scripted `GreedyAgent` and `PersonaTeacher` both follow the engine's `ferry`
-hints now, including the pickup, sail, landing and empty-transport return.
+It writes `amphibious` and `ferry_action` metadata, so the action selector can
+learn the pickup/sail/load/unload stages the original dataset never contained.
+The scripted `GreedyAgent` and `PersonaTeacher` both follow the engine's `ferry`
+hints, including the pickup, sail, landing and empty-transport return.
 
 State text is the compact codec (about 500 GPT-2 tokens, max 870 in this run;
 prefixes longer than `prefix_len` are skipped at training time).
@@ -139,7 +139,9 @@ parseability; the best checkpoint is saved to `artifacts/tbs/generator.pt`.
 | Tokenizer reconstruction (5,274 held-out orders) | **100% exact** |
 | Generator, 128 held-out states, epoch 4 | 35.9% exact, 100% parseable |
 | Generator, 500 held-out states | 25.2% exact, 99.4% parseable |
-| Inference | 60 ms per order on the 5070 Ti |
+| Generator, 496-state release sample | 19.4% exact, 99.8% parseable, 49.2% legal |
+| Inference, 832-token prefix | 56 ms per order on the 5070 Ti |
+| Inference, 2048-token prefix (default) | ~294 ms per order on the 5070 Ti |
 | NCM (B) vs greedy (A), seed 7, 40-turn cap | **NCM victory by capturing A's HQ, turn 25** |
 | NCM (B) vs 74B Nemotron (A), seed 7, 20-turn cap | **NCM victory by capturing A's HQ, turn 18** (earlier run) |
 | 60-game all-AI league vs Qwen3.8-27B IQ3_S | NCM Vanguard 17-13, NCM Siege 8-22, Qwen 16-14 (persona checkpoints) |
@@ -293,12 +295,27 @@ current league baseline is the Qwen model.
 The NCM side plays one generated order per step through
 `run_turn_stepwise`. It builds the legal set from the same view an LLM sees
 (affordable builds and units with a usable action), decodes each sample, and
-accepts an exact legal order immediately. On maps where the view exposes a
-`ferry` operation, `NcmAgent` first applies the same deterministic ferry
-advisor as the scripted teachers; the released checkpoint maps `l`/`u` to `m`
-even after a short fine-tune, so the advisor is what guarantees the multi-turn
-crossing while the model keeps every other decision. A longer fine-tune can
-internalize the action later. Otherwise it resamples up to six
+accepts an exact legal order immediately.
+
+Ferry play is a **two-stage learned policy**, not a scripted override. A small
+char-n-gram action selector (`tbs_ncm/action_model.py`, checkpoint
+`artifacts/tbs/action_clf.pt`) predicts the order's action character, including
+the ferry stages `l`/`u`/`p`/`s`/`r`; the full NCM generator still produces or
+scores the arguments from legal candidate lines. Train it with the game
+repository's ferry data:
+
+```powershell
+python -m tbs_ncm.train_action_clf `
+  --train "..\saves\ferry_data_train20.jsonl,tbs_ncm/data/train.jsonl" `
+  --validation "..\saves\ferry_data_val.jsonl,tbs_ncm/data/validation.jsonl" `
+  --out action_clf.pt --epochs 15 --device cuda
+```
+
+On the 162 held-out ferry rows the selector reaches 95% for `l` (20/21), 100%
+for `u` (14/14), 96% for the combined `p`/`s`/`r` stages (122/127), and 96.3%
+overall. The deployed `NcmAgent` auto-loads `artifacts/tbs/action_clf.pt`; if
+the checkpoint is missing it falls back to the generator's normal action
+choice. The regular decode path resamples up to six
 times and keeps the best candidate by repair kind and snap distance: same-unit
 coordinate/target repair, same-unit alternate action, unit-id snap, then a
 global nearest-legal line. Fuzzy unit ids only get a same-action repair, so a
@@ -329,8 +346,8 @@ python -m tbs_ncm.evaluate_orders --split test_sample.jsonl --limit 500
 ## Benchmark
 
 Measure per-order latency on the released sample.  Run it on an idle GPU for
-numbers you intend to publish; `legal` also scores the legal candidate lines,
-which is the UI's default path.
+numbers you intend to publish; `legal` also scores up to 16 legal candidate
+lines (the agent's rerank limit), which is the UI's default path.
 
 ```powershell
 python -m tbs_ncm.benchmark --split test_sample.jsonl --decode sample --repeat 3 `
@@ -338,27 +355,6 @@ python -m tbs_ncm.benchmark --split test_sample.jsonl --decode sample --repeat 3
 python -m tbs_ncm.benchmark --split test_sample.jsonl --decode legal --limit 20 `
   --out artifacts/tbs/benchmark_legal.json
 ```
-
-## Learned ferry action selector
-
-The generator is strong at order arguments but collapses the rare `l`/`u`
-actions to `m`.  `tbs_ncm/action_model.py` adds a tiny character-n-gram
-classifier that predicts just the action character from the state prefix; when
-`artifacts/tbs/action_clf.pt` exists, `NcmAgent` uses it on maps with a `ferry`
-block.  The generator still supplies the arguments through legal candidate
-lines.
-
-```powershell
-python -m tbs_ncm.train_action_clf `
-  --train "..\saves\ferry_data_train20.jsonl,tbs_ncm/data/train.jsonl" `
-  --validation "..\saves\ferry_data_val.jsonl,tbs_ncm/data/validation.jsonl" `
-  --out action_clf.pt --epochs 15 --device cuda
-```
-
-On the 759-row ferry validation split, the first released classifier reached
-84.7% overall, 100% on load (21/21) and unload (14/14), 96.6% on moves and
-43.2% on attacks.  The selector is optional; without the file the scripted
-ferry advisor is used.
 
 ## Watching a run
 

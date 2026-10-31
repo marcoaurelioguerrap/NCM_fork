@@ -1134,13 +1134,72 @@ class NcmAgent:
         """Pick a legal action-model order, or None to let the generator decide."""
         assert self.action_model is not None
         action = self.action_model.predict(state_text)
-        if action not in ("l", "u", "c"):
+        if action not in ("l", "u", "c", "p", "s", "r"):
             return None
+        units = {str(unit.get("id")): unit for unit in view.get("units", ()) if isinstance(unit, dict)}
+
+        if action in ("p", "s", "r"):
+            operations = [
+                item
+                for item in ((view.get("ferry") or {}).get("operations") or ())
+                if isinstance(item, dict)
+            ]
+            wanted = {
+                "p": {"pickup", "load"},
+                "s": {"sail"},
+                "r": {"reposition"},
+            }[action]
+            operation = next(
+                (item for item in operations if str(item.get("action")) in wanted),
+                None,
+            )
+            if operation is None:
+                return None
+            stage = str(operation.get("action"))
+            transport = str(operation.get("transport") or "")
+            cargo = str(operation.get("cargo") or "")
+            transport_pos = tuple(units.get(transport, {}).get("pos") or ()) or None
+            cargo_pos = tuple(units.get(cargo, {}).get("pos") or ()) or None
+            transport_to = operation.get("transport_to")
+            cargo_to = operation.get("cargo_to")
+            at = operation.get("at")
+            if stage == "load":
+                order = {"action": "load", "unit": transport, "cargo": cargo}
+            elif stage == "pickup":
+                if isinstance(cargo_to, (list, tuple)) and tuple(cargo_to) != cargo_pos:
+                    order = {"action": "move", "unit": cargo, "to": list(cargo_to)}
+                elif isinstance(transport_to, (list, tuple)) and tuple(transport_to) != transport_pos:
+                    order = {"action": "move", "unit": transport, "to": list(transport_to)}
+                else:
+                    order = {"action": "load", "unit": transport, "cargo": cargo}
+            elif stage == "sail":
+                if isinstance(transport_to, (list, tuple)) and tuple(transport_to) != transport_pos:
+                    order = {"action": "move", "unit": transport, "to": list(transport_to)}
+                elif isinstance(at, (list, tuple)):
+                    order = {
+                        "action": "unload",
+                        "unit": transport,
+                        "cargo": cargo,
+                        "target": list(at),
+                    }
+                else:
+                    return None
+            else:  # reposition
+                if not isinstance(transport_to, (list, tuple)):
+                    return None
+                order = {"action": "move", "unit": transport, "to": list(transport_to)}
+            try:
+                line = encode_order(order)
+            except (CodecError, KeyError):
+                return None
+            if line in set(allowed):
+                return order
+            return None
+
         candidates = [line for line in allowed if line.startswith(action + " ")]
         if not candidates:
             return None
 
-        units = {str(unit.get("id")): unit for unit in view.get("units", ()) if isinstance(unit, dict)}
         if action == "l":
             def load_key(line: str) -> tuple:
                 parts = line.split()

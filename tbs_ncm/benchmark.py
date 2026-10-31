@@ -7,9 +7,10 @@ file and prints the same payload, so a blog post can quote the exact run.
     python -m tbs_ncm.benchmark --checkpoint-dir artifacts/tbs `
       --split test_sample.jsonl --decode sample --repeat 3
 
-``--decode legal`` also scores the legal candidate lines for the sampled
-action/unit, approximating the UI's constrained decoder.  ``sample`` measures
-raw generation only.  Run it on an idle GPU for publishable numbers.
+``--decode legal`` also scores up to ``--candidates`` legal lines (default 16,
+the agent's rerank limit) for the sampled action/unit, approximating the UI's
+constrained decoder.  ``sample`` measures raw generation only.  Run it on an
+idle GPU for publishable numbers.
 """
 
 from __future__ import annotations
@@ -60,10 +61,12 @@ def summarize(values: list[float]) -> dict[str, float | int]:
     }
 
 
-def _run_once(sampler: NcmSampler, row: dict[str, Any], decode: str) -> None:
+def _run_once(
+    sampler: NcmSampler, row: dict[str, Any], decode: str, candidates: int
+) -> None:
     if decode == "legal":
         sampler.sample(row["prefix"], temperature=0.0)
-        legal = row.get("legal") or []
+        legal = (row.get("legal") or [])[: max(1, candidates)]
         if legal:
             sampler.score_lines(row["prefix"], [str(line) for line in legal])
     else:
@@ -80,6 +83,7 @@ def benchmark(
     limit: int = 0,
     warmup: int = 5,
     repeat: int = 1,
+    candidates: int = 16,
 ) -> dict[str, Any]:
     rows = _rows(Path(split), limit)
     if decode == "legal":
@@ -90,7 +94,7 @@ def benchmark(
     resolved_device = str(sampler.device)
 
     for row in rows[: max(0, warmup)]:
-        _run_once(sampler, row, decode)
+        _run_once(sampler, row, decode, candidates)
 
     if resolved_device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -102,7 +106,7 @@ def benchmark(
             if resolved_device.startswith("cuda") and torch.cuda.is_available():
                 torch.cuda.synchronize()
             started = time.perf_counter()
-            _run_once(sampler, row, decode)
+            _run_once(sampler, row, decode, candidates)
             if resolved_device.startswith("cuda") and torch.cuda.is_available():
                 torch.cuda.synchronize()
             timings.append((time.perf_counter() - started) * 1000.0)
@@ -113,6 +117,7 @@ def benchmark(
         "checkpoint_dir": str(Path(checkpoint_dir).resolve()),
         "split": str(Path(split).resolve()),
         "decode": decode,
+        "candidates": max(1, candidates) if decode == "legal" else 0,
         "prefix_len": sampler.prefix_len,
         "device": resolved_device,
         "torch": torch.__version__,
@@ -150,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="")
     parser.add_argument("--prefix-len", type=int, default=2048)
     parser.add_argument("--decode", choices=("sample", "legal"), default="sample")
+    parser.add_argument("--candidates", type=int, default=16, help="legal lines scored in legal mode")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeat", type=int, default=1)
@@ -165,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         warmup=args.warmup,
         repeat=args.repeat,
+        candidates=args.candidates,
     )
     text = json.dumps(payload, indent=2)
     print(text)
