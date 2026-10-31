@@ -320,11 +320,45 @@ That launches the game repo's UI with the NCM agent injected and the stepwise
 session (`--ncm-max-steps` bounds the batches per turn). The launcher changes to
 the game repository first, so saves land in its `saves/` directory.
 
-Held-out scoring:
+Held-out scoring (the release ZIP includes `test_sample.jsonl`):
 
 ```
-python -m tbs_ncm.evaluate_orders --split test.jsonl --limit 500
+python -m tbs_ncm.evaluate_orders --split test_sample.jsonl --limit 500
 ```
+
+## Benchmark
+
+Measure per-order latency on the released sample.  Run it on an idle GPU for
+numbers you intend to publish; `legal` also scores the legal candidate lines,
+which is the UI's default path.
+
+```powershell
+python -m tbs_ncm.benchmark --split test_sample.jsonl --decode sample --repeat 3 `
+  --out artifacts/tbs/benchmark_sample.json
+python -m tbs_ncm.benchmark --split test_sample.jsonl --decode legal --limit 20 `
+  --out artifacts/tbs/benchmark_legal.json
+```
+
+## Learned ferry action selector
+
+The generator is strong at order arguments but collapses the rare `l`/`u`
+actions to `m`.  `tbs_ncm/action_model.py` adds a tiny character-n-gram
+classifier that predicts just the action character from the state prefix; when
+`artifacts/tbs/action_clf.pt` exists, `NcmAgent` uses it on maps with a `ferry`
+block.  The generator still supplies the arguments through legal candidate
+lines.
+
+```powershell
+python -m tbs_ncm.train_action_clf `
+  --train "..\saves\ferry_data_train20.jsonl,tbs_ncm/data/train.jsonl" `
+  --validation "..\saves\ferry_data_val.jsonl,tbs_ncm/data/validation.jsonl" `
+  --out action_clf.pt --epochs 15 --device cuda
+```
+
+On the 759-row ferry validation split, the first released classifier reached
+84.7% overall, 100% on load (21/21) and unload (14/14), 96.6% on moves and
+43.2% on attacks.  The selector is optional; without the file the scripted
+ferry advisor is used.
 
 ## Watching a run
 
