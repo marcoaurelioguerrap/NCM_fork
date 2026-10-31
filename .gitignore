@@ -223,3 +223,6 @@ artifacts/
 /eval/
 data/
 .hf/
+
+# local pointer to the game checkout
+.tbs_game_repo

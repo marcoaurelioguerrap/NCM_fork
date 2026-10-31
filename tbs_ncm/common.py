@@ -15,12 +15,31 @@ from omegaconf import OmegaConf
 
 HERE = Path(__file__).resolve().parent
 NCM_ROOT = HERE.parent
-GAME_REPO = Path(
-    os.environ.get(
-        "TBS_GAME_REPO",
-        r"C:\Users\marco\OneDrive\Documentos\opencode_code\turn_based_strategy_vibe",
+
+
+def _resolve_game_repo() -> Path:
+    """Find the game checkout without baking a machine-specific path in."""
+    configured = os.environ.get("TBS_GAME_REPO")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    candidates = (
+        NCM_ROOT.parent / "turn_based_strategy_vibe",
+        NCM_ROOT.parent / "tbs",
+        NCM_ROOT / "tbs",
     )
-)
+    for candidate in candidates:
+        if (candidate / "tbs" / "engine").is_dir():
+            return candidate.resolve()
+    local = NCM_ROOT / ".tbs_game_repo"
+    if local.is_file():
+        return Path(local.read_text(encoding="utf-8").strip()).expanduser().resolve()
+    raise RuntimeError(
+        "Cannot find the game checkout. Clone it next to this repository "
+        "(../turn_based_strategy_vibe or ../tbs) or set TBS_GAME_REPO to its path."
+    )
+
+
+GAME_REPO = _resolve_game_repo()
 DATA_DIR = HERE / "data"
 ARTIFACT_DIR = NCM_ROOT / "artifacts" / "tbs"
 CONFIG_PATH = HERE / "config.yaml"
